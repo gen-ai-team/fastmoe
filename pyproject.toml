@@ -1,0 +1,62 @@
+[project]
+name = "fastmoe"
+version = "0.1.0"
+description = "High-performance Expert Parallelism with Fused Kernels"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "numpy",
+    "matplotlib",
+    "triton; sys_platform == 'linux'",
+    "pydantic>=2.12.5",
+    "loguru>=0.7.3",
+    "pydantic-settings>=2.12.0",
+]
+
+[project.optional-dependencies]
+flash = [
+    # Flash Attention also generally requires CUDA/Linux
+    "flash-attn==2.8.3; sys_platform == 'linux'",
+]
+dev = [
+  "ruff>=0.5.0",
+  "black>=24.3.0",
+  "mypy>=1.8.0",
+  "pytest>=7.4",
+  "pytest-cov>=4.1",
+]
+profiling = [
+  "tensorboard>=2.13",
+]
+
+[[tool.uv.dependency-metadata]]
+name = "flash-attn"
+version = "2.8.3"
+requires-dist = ["torch", "einops"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fastmoe"]
+
+[tool.hatch.build.targets.editable]
+packages = ["src/fastmoe"]
+
+# [tool.uv.extra-build-dependencies]
+# flash-attn = [{ requirement = "torch", match-runtime = true }]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E203"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+strict_optional = true
