@@ -349,7 +349,6 @@ def grouped_weighted_scatter_add(
             if k > 0:
                 idx_chunk = indices[offset : offset + k]
                 w_chunk = weights[offset : offset + k]
-                # Fallback to slow but correct PyTorch ops
                 out.index_add_(0, idx_chunk, t * w_chunk.unsqueeze(-1))
             offset += k
         return out
