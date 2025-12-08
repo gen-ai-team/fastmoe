@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [ master ]
+  push:
+    branches: [ master ]
+
+jobs:
+  quality-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 1. Install uv (Lightning fast python manager)
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      # 2. Sync Environment
+      # Installs dependencies exactly as specified in uv.lock
+      # --frozen ensures CI fails if uv.lock is out of sync with pyproject.toml
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      # 3. Code Quality
+      - name: Run Pre-commit Hooks
+        run: uvx pre-commit run --all-files --show-diff-on-failure
+
+      # 4. Correctness Test
+      # Uses your Makefile to execute the CPU simulation test
+      # This runs: export CUDA_VISIBLE_DEVICES= && uv run python tests/test_correctness.py
+      - name: Run CPU Correctness Test
+        run: make install && make test
