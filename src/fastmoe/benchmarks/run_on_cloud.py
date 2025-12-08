@@ -5,7 +5,7 @@ import torch.optim as optim
 from loguru import logger
 
 from fastmoe import consts
-from fastmoe.config import MoEScale, get_config, init_app
+from fastmoe.config import MoEScale, MoESetup, get_config, init_app
 from fastmoe.kernels.ops import grouped_weighted_scatter_add, prepare_grouped_metadata
 from fastmoe.models.tiny_model import TinyModel
 
@@ -98,7 +98,7 @@ def benchmark_fastmoe_grouped(expert_outputs, indices, weights, out_shape, steps
     return start_event.elapsed_time(end_event) / steps, peak_mem
 
 
-def run_training_experiment(implementation: str, cfg):
+def run_training_experiment(implementation: str, cfg: MoESetup):
     """
     Runs a realistic training loop for N steps using AMP (Automatic Mixed Precision).
     """
