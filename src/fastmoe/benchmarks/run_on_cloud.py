@@ -4,6 +4,7 @@ import torch
 import torch.optim as optim
 from loguru import logger
 
+from fastmoe import consts
 from fastmoe.config import MoEScale, get_config, init_app
 from fastmoe.kernels.ops import grouped_weighted_scatter_add, prepare_grouped_metadata
 from fastmoe.models.tiny_model import TinyModel
@@ -252,14 +253,14 @@ def run_on_cloud():
 
     # 1. Run Standard
     try:
-        std_time, std_mem = run_training_experiment("standard", cfg)
+        std_time, std_mem = run_training_experiment(consts.MoEImplementation.STANDARD, cfg)
         logger.info(f"Standard: {std_time:.2f} ms/step | Peak Mem: {std_mem:.2f} GB")
     except torch.cuda.OutOfMemoryError:
         logger.error("Standard: OOM (Out Of Memory)!")
         std_time, std_mem = float("inf"), float("inf")
 
     # 2. Run FastMoE
-    fast_time, fast_mem = run_training_experiment("fast", cfg)
+    fast_time, fast_mem = run_training_experiment(consts.MoEImplementation.FAST, cfg)
     logger.info(f"FastMoE:  {fast_time:.2f} ms/step | Peak Mem: {fast_mem:.2f} GB")
 
     # 3. Comparison
