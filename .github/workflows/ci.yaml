@@ -36,4 +36,4 @@ jobs:
       # Uses your Makefile to execute the CPU simulation test
       # This runs: export CUDA_VISIBLE_DEVICES= && uv run python tests/test_correctness.py
       - name: Run CPU Correctness Test
-        run: make test
+        run: make install && make test
