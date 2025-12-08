@@ -19,24 +19,6 @@ except ImportError:
 
 
 # =========================================================================
-#  Environment Shim
-# =========================================================================
-try:
-    import triton
-    import triton.language as tl
-
-    HAS_TRITON = True
-except ImportError:
-    HAS_TRITON = False
-    from unittest.mock import MagicMock
-
-    triton = MagicMock()
-    tl = MagicMock()
-    triton.jit = lambda f: f
-    tl.constexpr = int
-
-
-# =========================================================================
 #  Triton Kernel: The "Grouped Scatter-Add" Engine
 # =========================================================================
 #
