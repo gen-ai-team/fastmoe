@@ -100,7 +100,24 @@ class MoEFeedForward(nn.Module):
             recv_splits,
         )
 
-    def compute_experts(self, recv_data, expert_indices_sorted):
+    def compute_experts(self, recv_data, expert_indices_sorted) -> list[torch.Tensor]:
+        # =========================================================================
+        #  DATA FLOW TRACE (Scenario: Rank 0 of 2, 8 Experts Total)
+        # =========================================================================
+        # Setup:
+        #   - We are Rank 0. We own Experts [0, 1, 2, 3].
+        #   - Rank 1 owns Experts [4, 5, 6, 7].
+        #
+        # Input State:
+        #   - recv_data: A flat, contiguous tensor of tokens sent to us from the network.
+        #     Shape: [6, D]. (Why 6? Because Exp0=2, Exp1=3, Exp2=0, Exp3=1 tokens).
+        #     Content: [Tok_E0, Tok_E0, Tok_E1, Tok_E1, Tok_E1, Tok_E3]
+        #     Note: There are NO separators. It's just a blob.
+        #
+        #   - expert_indices_sorted: Global indices sorted by expert.
+        #     [0, 0, 1, 1, 1, 3, 4, 4, 5, 7] (Total 10 tokens in global batch)
+        # =========================================================================
+
         # We need to slice recv_data based on LOCAL expert counts
         # We know we received tokens for our local experts.
         # We re-calculate counts just for the subset of experts we own.
@@ -113,6 +130,7 @@ class MoEFeedForward(nn.Module):
         # Calculate offsets for this rank
         start_expert = self.rank * self.num_local_experts
         end_expert = start_expert + self.num_local_experts
+        # Trace: Rank=0, num_local=4 -> start=0, end=4. We own Experts 0..3.
 
         # To split 'recv_data' correctly, we need the counts for OUR experts.
         # We can look at the global 'expert_indices_sorted', but that's on the sender side.
@@ -128,13 +146,22 @@ class MoEFeedForward(nn.Module):
         # For now, let's use the global counts we calculated in dispatch, assuming single-device simulation # noqa
         # or that we can access them.
         expert_counts_global = torch.bincount(expert_indices_sorted, minlength=self.num_experts)
+        # Trace: bincount([0,0,1,1,1,3,4,4,5,7]) -> [2, 3, 0, 1, 2, 1, 0, 1]
+
         local_expert_counts = expert_counts_global[start_expert:end_expert]
+        # Trace: Slice [0:4] -> [2, 3, 0, 1].
+        # Meaning: "Cut the blob into chunks of size 2, 3, 0, and 1."
 
         # If running distributed, recv_data size must match sum(local_expert_counts)
         # If it doesn't (due to load balancing shift), this slicing will fail.
         # But for the benchmark (single GPU), this is safe.
 
         tokens_per_expert = torch.split(recv_data, local_expert_counts.tolist())
+        # Trace: recv_data (size 6) is split into:
+        #   - T0: [2, D] (For Expert 0)
+        #   - T1: [3, D] (For Expert 1)
+        #   - T2: [0, D] (For Expert 2 - Empty!)
+        #   - T3: [1, D] (For Expert 3)
 
         results = []
         for i, expert in enumerate(self.experts):
@@ -144,6 +171,14 @@ class MoEFeedForward(nn.Module):
                 results.append(
                     torch.empty(0, self.dim, device=recv_data.device, dtype=recv_data.dtype)
                 )
+        # Trace:
+        #   - runs Expert0(T0) -> [2, D]
+        #   - runs Expert1(T1) -> [3, D]
+        #   - skips Expert2    -> [0, D]
+        #   - runs Expert3(T3) -> [1, D]
+        #
+        # Result: A List of 4 disjoint tensors living in different memory locations.
+        # We pass this LIST to 'combine'
 
         # Return LIST for the Grouped Kernel
         return results
@@ -245,9 +280,16 @@ class MoEFeedForward(nn.Module):
     #     return out.view(B, T, D)
 
     def forward(self, x):
+        # [B, T, D] -> [N, D], where N = B x T, because the router treats tokens independently
+        # We save (B, T) so we can un-flatten the tensor at the very end.
         x_flat, weights, indices, shape = self.gate(x)
+        # the Communication phase. Experts process data in batches, so we must group all tokens for "Expert 0" together, # noqa
+        # all tokens for "Expert 1" together, etc.
         permuted, sorted_idx, rev_map, sorted_w, send_splits, recv_splits = self.dispatch(
             x_flat, weights, indices
         )
+        # Computation phase
+        # returns a List[Tensor]
         expert_out_list = self.compute_experts(permuted, sorted_idx)
+        # Reassembler
         return self.combine(expert_out_list, rev_map, sorted_w, shape, send_splits, recv_splits)
