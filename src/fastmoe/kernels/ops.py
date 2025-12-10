@@ -195,28 +195,76 @@ def _grouped_weighted_scatter_add_kernel(
 
 
 # =========================================================================
-#  Metadata Helper
+#  Metadata Helper: The "Flight Planner"
 # =========================================================================
 def prepare_grouped_metadata(expert_tensors, device):
     """
-    Data-Plane prep logic.
-    Extracts raw pointers and shapes from PyTorch tensors to feed the kernel.
-    Doing this outside the kernel allows us to use CUDA Graphs (Static Capture).
+    Converts high-level Python Tensors into low-level Integer Arrays (Metadata)
+    that the GPU kernel can read to navigate memory.
+
+    SCENARIO TRACE:
+    ---------------
+    Input: A list of 3 disjoint tensors living in VRAM.
+      - T0 (Red):   Shape [3, D]. Address 0xA000.
+      - T1 (Blue):  Shape [2, D]. Address 0xB000.
+      - T2 (Green): Shape [3, D]. Address 0xC000.
     """
-    # Extract raw memory addresses (int64)
-    # This is safe because PyTorch Storage is pinned in VRAM.
+
+    # -------------------------------------------------------------
+    # 1. POINTER EXTRACTION (The "Where")
+    # -------------------------------------------------------------
+    # We strip away the PyTorch tensor abstraction. We just want the raw
+    # 64-bit integer that represents the memory address of the first byte.
+    #
+    # Trace:
+    #   ptr_list = [40960, 45056, 49152]  (Decimal for 0xA000, 0xB000...)
     ptr_list = [t.data_ptr() for t in expert_tensors]
+
+    # Move to GPU. The kernel will read this to "teleport" between buffers.
     ptr_table = torch.tensor(ptr_list, dtype=torch.int64, device=device)
 
+    # -------------------------------------------------------------
+    # 2. SIZE EXTRACTION (The "How Much")
+    # -------------------------------------------------------------
+    # How many rows (tokens) does each expert possess?
+    #
+    # Trace:
+    #   sizes_list = [3, 2, 3]
     sizes_list = [t.shape[0] for t in expert_tensors]
     chunk_sizes = torch.tensor(sizes_list, dtype=torch.int32, device=device)
 
-    # Calculate offsets via prefix sum (cumsum)
-    # Example: Sizes [2, 3, 1] -> Offsets [0, 2, 5]
+    # -------------------------------------------------------------
+    # 3. OFFSET CALCULATION (The "Global ID")
+    # -------------------------------------------------------------
+    # We need to map a local expert row (e.g., Row 0 of Expert 1) back to
+    # the global token sequence to find the correct indices/weights.
+    # We do this via a Prefix Sum (Cumulative Sum).
+    #
+    # Trace:
+    #   sizes:  [3, 2, 3]
+    #   cumsum: [3, 5, 8]  (After Expert 0, there are 3 tokens...)
+
     zeros = torch.zeros(1, dtype=torch.int32, device=device)
     cumsum = torch.cumsum(chunk_sizes, dim=0)[:-1]
+
+    # Shift right to get starting offsets:
+    # Trace:
+    #   expert_offsets = [0, 3, 5]
+    #   - Expert 0 starts at Global ID 0.
+    #   - Expert 1 starts at Global ID 3.
+    #   - Expert 2 starts at Global ID 5.
     expert_offsets = torch.cat((zeros, cumsum))
 
+    # -------------------------------------------------------------
+    # 4. GRID CONFIGURATION
+    # -------------------------------------------------------------
+    # Determine the shape of the 2D Kernel Grid.
+    # Height = Size of largest expert.
+    # Width  = Number of experts.
+
+    # Trace: max(3, 2, 3) = 3.
+    # We will launch a grid of height 3.
+    # Threads assigned to Expert 1 (size 2) at Row 2 will trigger the Early Exit.
     max_rows = max(sizes_list) if sizes_list else 0
     num_experts = len(sizes_list)
 
