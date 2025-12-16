@@ -14,13 +14,11 @@ def verify_correctness(expert_outputs, indices, weights, out_shape):
     logger.info("Verifying numerical correctness...")
     device = expert_outputs[0].device
 
-    # 1. Standard
     combined = torch.cat(expert_outputs, dim=0)
     weighted = combined * weights.unsqueeze(-1)
     out_std = torch.zeros(out_shape, device=device)
     out_std.index_add_(0, indices, weighted)
 
-    # 2. FastMoE (Grouped)
     out_fast = torch.zeros(out_shape, device=device)
     grouped_weighted_scatter_add(expert_outputs, indices, weights, out_shape, out=out_fast)
 
@@ -176,7 +174,7 @@ def run_training_experiment(implementation: str, cfg: MoESetup):
         if step % 10 == 0 or step == cfg.active_steps - 1:
             loss_val = loss.item()
             curr_mem = torch.cuda.memory_allocated() / (1024**3)
-            # Log Grad Norm too
+            # Grad Norm
             logger.info(
                 f"Step {step:03d}/{cfg.active_steps} | Loss: {loss_val:.4f} | GradNorm: {total_norm:.4f} | Mem: {curr_mem:.2f} GB"  # noqa
             )

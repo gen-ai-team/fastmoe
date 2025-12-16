@@ -116,12 +116,27 @@ Speed is useless without accuracy. We implemented a strict numerical verificatio
 
 ---
 
-## 6. Future Work: Deliverable 2
+## 6. Expert Parallel
 
-With the memory bottleneck solved, the next phase focuses on **Latency Hiding**.
-We will implement the **Parallel Transformer Block** architecture:
-$$Y = X + \text{Attention}(X) + \text{MoE}(X)$$
-This allows the MoE communication and computation to run on a side stream, completely overlapping with the Attention mechanism.
+Hybrid Pipelining: We keep the Attention mechanism on the full batch to maximize Tensor Core utilization. We only pipeline the MoE block, splitting the input into two micro-batches.
+
+**Overlap Schedule:**
+
+- While Micro-batch 1 is performing its all-to-all dispatch, Micro-batch 2 is being gated.
+
+- While Micro-batch 1 is computing experts, Micro-batch 2 is performing its all-to-all dispatch.
+
+- While Micro-batch 1 is performing its all-to-all combine, Micro-batch 2 is computing experts.
+
+**Profiling:** Below are the Chrome Traces visualizing the execution.
+
+The common attention compute:
+
+![Common attention compute](assets/attention.png)
+
+Followed by the "Experts" compute blocks overlapping perfectly with the "all_to_all" communication blocks, removing idle time:
+
+![Pipelined MoE compute](assets/gate_and_experts.png)
 
 ---
 

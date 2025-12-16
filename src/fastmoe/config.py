@@ -14,21 +14,12 @@ class MoEScale(str, Enum):
 
 class MoESetup(BaseSettings):
     scale: MoEScale = MoEScale.DEBUG
-
-    # Dimensions
-    # Note: Global Batch Size in training is huge, but Micro-Batch per GPU is usually small (1-4).
-    # We use a realistic per-GPU micro-batch here.
     batch_size: int = 4
     seq_len: int = 4096
-
-    # Model Architecture
     hidden_dim: int = 4096
 
-    # MoE Specifics
     num_experts: int = 8
     top_k: int = 2
-
-    # Experiment Settings
     warmup_steps: int = 10
     active_steps: int = 50
 
@@ -61,7 +52,6 @@ def get_config(scale: MoEScale = MoEScale.DEBUG) -> MoESetup:
         )
 
     elif scale == MoEScale.GIGACHAT_10B:
-        # Configuration roughly matching Mixtral 8x7B or similar mid-sized MoE
         return MoESetup(
             scale=MoEScale.GIGACHAT_10B,
             batch_size=4,  # Micro-batch per GPU
@@ -72,8 +62,6 @@ def get_config(scale: MoEScale = MoEScale.DEBUG) -> MoESetup:
         )
 
     elif scale == MoEScale.GIGACHAT_700B:
-        # Configuration for massive scale (e.g., DeepSeek-V3, GPT-4 proxies)
-        # The hidden dimension grows significantly, and expert count often increases.
         return MoESetup(
             scale=MoEScale.GIGACHAT_700B,
             batch_size=2,  # Reduced due to memory pressure

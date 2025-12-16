@@ -5,7 +5,6 @@ from fastmoe import consts
 from fastmoe.layers.moe import MoEFeedForward
 
 
-# [Exact Copy of MultiheadSelfAttention from your provided snippet]
 class MultiheadSelfAttention(nn.Module):
     def __init__(self, dim, n_heads):
         super().__init__()
@@ -30,7 +29,6 @@ class MultiheadSelfAttention(nn.Module):
         return self.proj(out)
 
 
-# [Standard FF kept for reference/hybrid models]
 class FeedForward(nn.Module):
     def __init__(self, dim, ff_dim):
         super().__init__()
