@@ -117,27 +117,27 @@ Speed is useless without accuracy. We implemented a strict numerical verificatio
 ---
 
 ## 6. Expert Parallel
+DeepSeek-V3 Style "Zig-Zag" Pipelining: We implement a dual-stream pipeline where two micro-batches (MB0 and MB1) are processed in parallel on separate CUDA streams. This maximizes GPU utilization by perfectly overlapping computation (Attention, Expert MLPs) with communication (All-to-All Dispatch/Combine).
 
-Hybrid Pipelining: We keep the Attention mechanism on the full batch to maximize Tensor Core utilization. We only pipeline the MoE block, splitting the input into two micro-batches.
+### Overlap Schedule:
 
-**Overlap Schedule:**
+The schedule uses a "Zig-Zag" pattern where Stream 1 (MB1) is staggered slightly behind Stream 0 (MB0) to align computation with communication:
 
-- While Micro-batch 1 is performing its all-to-all dispatch, Micro-batch 2 is being gated.
+1. Attn vs. Dispatch: While Stream 1 computes Attention for MB1, Stream 0 performs the Dispatch (All-to-All) for MB0.
 
-- While Micro-batch 1 is computing experts, Micro-batch 2 is performing its all-to-all dispatch.
+2. Dispatch vs. Experts: While Stream 1 performs Dispatch for MB1, Stream 0 computes the Expert MLPs for MB0.
 
-- While Micro-batch 1 is performing its all-to-all combine, Micro-batch 2 is computing experts.
+3. Experts vs. Combine: While Stream 1 computes Expert MLPs for MB1, Stream 0 performs the Combine (All-to-All) for MB0.
 
-**Profiling:** Below are the Chrome Traces visualizing the execution.
+### Profiling:
 
-The common attention compute:
+**Target**:
+![DeepEP Micro-Batching](assets/micro-batching.png)
 
-![Common attention compute](assets/attention.png)
+[Source](https://github.com/deepseek-ai/DeepEP?tab=readme-ov-file)
 
-Followed by the "Experts" compute blocks overlapping perfectly with the "all_to_all" communication blocks, removing idle time:
-
-![Pipelined MoE compute](assets/gate_and_experts.png)
-
+**Ours**:
+WIP
 ---
 
 **License:** MIT

@@ -14,12 +14,19 @@ class MoEScale(str, Enum):
 
 class MoESetup(BaseSettings):
     scale: MoEScale = MoEScale.DEBUG
+
+    # Model
     batch_size: int = 4
     seq_len: int = 4096
     hidden_dim: int = 4096
+    n_heads: int = 32
+    ff_dim: int = 4096
+    n_layers: int = 2
 
+    # MoE
     num_experts: int = 8
     top_k: int = 2
+
     warmup_steps: int = 10
     active_steps: int = 50
 
@@ -48,16 +55,21 @@ def get_config(scale: MoEScale = MoEScale.DEBUG) -> MoESetup:
 
     if scale == MoEScale.DEBUG:
         return MoESetup(
-            scale=MoEScale.DEBUG, batch_size=2, seq_len=128, hidden_dim=512, num_experts=4, top_k=2
+            scale=MoEScale.DEBUG,
+            batch_size=2,
+            seq_len=128,
+            hidden_dim=512,
+            num_experts=4,
+            top_k=2,
         )
 
     elif scale == MoEScale.GIGACHAT_10B:
         return MoESetup(
             scale=MoEScale.GIGACHAT_10B,
-            batch_size=4,  # Micro-batch per GPU
-            seq_len=4096,  # Standard context
-            hidden_dim=4096,  # Standard 7B-10B model width
-            num_experts=8,  # 8 Experts
+            batch_size=32,  # High batch for compute intensity
+            seq_len=4096,
+            hidden_dim=8192,  # Wide layers to balance H100 NVLink speed
+            num_experts=8,
             top_k=2,
         )
 

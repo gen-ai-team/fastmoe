@@ -1,6 +1,25 @@
 import contextlib
 
 
+class MockWork:
+    def wait(self):
+        pass
+
+
+class MockEvent:
+    def record(self, stream=None):
+        pass
+
+    def wait(self, stream=None):
+        pass
+
+    def synchronize(self):
+        pass
+
+    def elapsed_time(self, end_event):
+        return 0.0
+
+
 class MockStream:
     def __init__(self, device=None, priority=0):
         self.device = device
@@ -17,23 +36,16 @@ class MockStream:
     def wait_event(self, event):
         pass
 
+    # --- FIX: Context Manager Protocol ---
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        pass
+
     @contextlib.contextmanager
     def _use_stream(self):
         yield
-
-
-class MockEvent:
-    def record(self, stream=None):
-        pass
-
-    def wait(self, stream=None):
-        pass
-
-    def synchronize(self):
-        pass
-
-    def elapsed_time(self, end_event):
-        return 0.0
 
 
 class MockStreamManager:
