@@ -32,7 +32,7 @@ class TestFastMoE(unittest.TestCase):
         """Setup configuration and shared mocks for every test."""
         # 1. Create a standard Tiny Config
         # We simulate world_size=2 to check split logic
-        self.cfg = get_cfg(world_size=2, scale=MoEScale.TINY)
+        self.cfg = get_cfg(world_size=2, scale=MoEScale.CI)
 
         # 2. Mock the Stream Dictionary required by the new signature
         # The model expects a dict of {Enum: Stream}

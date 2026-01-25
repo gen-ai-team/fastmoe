@@ -9,6 +9,7 @@ from pydantic_settings import BaseSettings
 
 class MoEScale(str, Enum):
     TINY = "tiny"
+    CI = "ci"  # CI scale for GitHub Actions
 
 
 class MoESetup(BaseSettings):
@@ -76,6 +77,20 @@ def get_moe_config(scale: MoEScale = MoEScale.TINY) -> MoESetup:
 
     if scale == MoEScale.TINY:
         return MoESetup()
+
+    # Toy configuration that fits in <2GB RAM for CI testing
+    if scale == MoEScale.CI:
+        return MoESetup(
+            scale=MoEScale.CI,
+            hidden_dim=64,
+            proj_dim=4 * 64,
+            num_heads=4,
+            batch_size=8,
+            seqlen=32,
+            warmup_steps=1,
+            active_steps=1,
+            comm_scaling_factor=1,
+        )
 
     raise NotImplementedError
 
