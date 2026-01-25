@@ -117,27 +117,28 @@ Speed is useless without accuracy. We implemented a strict numerical verificatio
 ---
 
 ## 6. Expert Parallel
-DeepSeek-V3 Style "Zig-Zag" Pipelining: We implement a dual-stream pipeline where two micro-batches (MB0 and MB1) are processed in parallel on separate CUDA streams. This maximizes GPU utilization by perfectly overlapping computation (Attention, Expert MLPs) with communication (All-to-All Dispatch/Combine).
 
-### Overlap Schedule:
+**Hybrid Pipelining Strategy:** To address the significant communication overhead of All-to-All operations in MoE models, we implement the **Micro-Batch Pipelined"** strategy. Instead of treating the MoE block in isolation, we pipeline it together with the subsequent non-MoE layers (e.g., the next layer's Attention).
 
-The schedule uses a "Zig-Zag" pattern where Stream 1 (MB1) is staggered slightly behind Stream 0 (MB0) to align computation with communication:
+**Key Idea:**
+We split the batch into micro-batches. While one micro-batch is stalled on communication (dispatch/combine), the GPU is kept busy computing the dense operations (Attention/FFN) for another micro-batch of the *next layer*. This effectively "pulls" future compute work backward to fill the communication bubbles of the current layer.
 
-1. Attn vs. Dispatch: While Stream 1 computes Attention for MB1, Stream 0 performs the Dispatch (All-to-All) for MB0.
+**Overlap Schedule (5-Stage Pipeline):**
 
-2. Dispatch vs. Experts: While Stream 1 performs Dispatch for MB1, Stream 0 computes the Expert MLPs for MB0.
+1.  **Pre-Ops (Compute Stream):** Compute Attention and Gating for Micro-batch $N$ (Layer $L$).
+2.  **Dispatch (Comm Stream):** Send tokens for Micro-batch $N$ to correct experts.
+3.  **Experts (Expert Stream):** Compute Experts for Micro-batch $N$.
+4.  **Combine (Comm Stream):** Gather results for Micro-batch $N$.
+5.  **Post-Ops (Compute Stream):** Compute **Attention for Layer $L+1$** using the results of Micro-batch $N$. This overlaps perfectly with the `Combine` communication of the next micro-batch.
 
-3. Experts vs. Combine: While Stream 1 computes Expert MLPs for MB1, Stream 0 performs the Combine (All-to-All) for MB0.
+**Profiling Verification:**
 
-### Profiling:
+Below are Chrome Traces from our implementation visualizing this overlap. You can see the characteristic "staircase" pattern where Communication (green) runs in parallel with Expert Compute (blue) and Next-Layer Attention (purple).
 
-**Target**:
-![DeepEP Micro-Batching](assets/micro-batching.png)
 
-[Source](https://github.com/deepseek-ai/DeepEP?tab=readme-ov-file)
+* **Pipelined Execution:** The "Experts" compute blocks and "Next Layer Attention" blocks overlap perfectly with the "all_to_all" communication blocks, virtually eliminating idle time.
+    ![Pipelined MoE compute vs comm](assets/compute_vs_comm_overlap.jpg)
 
-**Ours**:
-WIP
 ---
 
 **License:** MIT

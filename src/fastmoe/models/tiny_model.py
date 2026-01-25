@@ -4,505 +4,423 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.profiler import record_function
 
-from fastmoe import consts
-from fastmoe.kernels.ops import grouped_weighted_scatter_add
+from fastmoe.comm import Streams, get_ep_streams
+from fastmoe.config import Config
 
 
-# ====== Self-Attention ====== #
-class MultiheadSelfAttention(nn.Module):
-    def __init__(self, dim, n_heads):
+# ==========================================
+# Modules
+# ==========================================
+class SelfAttention(nn.Module):
+    """
+    Standard Multi-Head Attention to simulate realistic compute workloads.
+    """
+
+    def __init__(self, hidden_dim: int, num_heads: int) -> None:
         super().__init__()
-        assert dim % n_heads == 0
-        self.dim = dim
-        self.n_heads = n_heads
-        self.hd = dim // n_heads
-        self.qkv = nn.Linear(dim, 3 * dim, bias=False)
-        self.proj = nn.Linear(dim, dim, bias=False)
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
 
-    def forward(self, x):  # x: [B,T,D]
-        B, T, D = x.shape
-        qkv = self.qkv(x).view(B, T, 3, self.n_heads, self.hd).transpose(1, 2)
-        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-        att = (q @ k.transpose(-2, -1)) / (self.hd**0.5)
-        att = att.softmax(dim=-1)
-        out = att @ v
-        out = out.transpose(1, 2).contiguous().view(B, T, D)
-        return self.proj(out)
+        self.q_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.k_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.v_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.o_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
 
-
-# ========= Feed Forward ========= #
-class FeedForward(nn.Module):
-    def __init__(self, dim, ff_dim):
-        super().__init__()
-        self.fc1 = nn.Linear(dim, ff_dim, bias=False)
-        self.fc2 = nn.Linear(ff_dim, dim, bias=False)
-
-    def forward(self, x):
-        return self.fc2(F.gelu(self.fc1(x)))
-
-
-class MoEFeedForward(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        ff_dim: int,
-        num_experts: int,
-        top_k: int,
-        implementation: consts.MoEImplementation,
-        group: dist.ProcessGroup | None = None,
-    ):
-        super().__init__()
-        self.dim = dim
-        self.num_experts = num_experts
-        self.top_k = top_k
-        self.implementation = implementation
-        self.group = group
-
-        if dist.is_initialized():
-            self.world_size = dist.get_world_size(group)
-            self.rank = dist.get_rank(group)
-        else:
-            self.world_size = 1
-            self.rank = 0
-
-        assert num_experts % self.world_size == 0, "Experts must divide evenly"
-        self.num_local_experts = num_experts // self.world_size
-
-        self.router = nn.Linear(dim, num_experts, bias=False)
-        self.experts = nn.ModuleList(
-            [
-                nn.Sequential(
-                    nn.Linear(dim, ff_dim, bias=False),
-                    nn.GELU(),
-                    nn.Linear(ff_dim, dim, bias=False),
-                )
-                for _ in range(self.num_local_experts)
-            ]
-        )
-
-    def gate_and_sort(self, x: torch.Tensor):
-        """
-        Stage 1: Local Gating and Indices Calculation
-        Returns:
-            permuted_data: The tokens sorted by expert.
-            rank_counts: Total tokens to send to each rank (for Data All-to-All).
-            expert_counts_by_rank: Detailed token counts per expert per rank
-            (for Metadata All-to-All).
-            ...
-        """
-        B, T, D = x.shape
-        x_flat = x.view(-1, D)
-
-        # Router
-        logits = self.router(x_flat)
-        topk_weights, topk_indices = torch.topk(logits, self.top_k, dim=-1)
-        topk_weights = F.softmax(topk_weights, dim=-1, dtype=torch.float32).type_as(x)
-
-        # Flatten for routing
-        indices_flat = topk_indices.view(-1)
-        weights_flat = topk_weights.view(-1)
-
-        # Sort tokens by expert ID
-        sort_indices = torch.argsort(indices_flat)
-        expert_indices_sorted = indices_flat[sort_indices]
-
-        # Restore map
-        src_indices = torch.arange(x_flat.shape[0], device=x.device).repeat_interleave(self.top_k)
-        reverse_map_indices = src_indices[sort_indices]
-        sorted_weights = weights_flat[sort_indices]
-
-        # Permute input data
-        permuted_data = x_flat[reverse_map_indices]
-
-        # 1. Count tokens per GLOBAL expert [Num_Experts]
-        global_expert_counts = torch.bincount(expert_indices_sorted, minlength=self.num_experts)
-
-        # 2. Reshape to [World_Size, Local_Experts] to get the detailed distribution
-        # This tells us: "For Rank R, how many tokens for LocalExpert 0, LocalExpert 1, etc."
-        if self.world_size > 1:
-            expert_counts_by_rank = global_expert_counts.view(
-                self.world_size, self.num_local_experts
-            )
-            # Sum for the Data communication (we just need total volume per rank)
-            rank_counts = expert_counts_by_rank.sum(dim=1)
-        else:
-            expert_counts_by_rank = global_expert_counts.view(1, self.num_experts)
-            rank_counts = torch.tensor([permuted_data.shape[0]], device=x.device, dtype=torch.long)
-
-        # We must ensure expert_counts_by_rank is Int/Long for NCCL
-        return (
-            permuted_data,
-            rank_counts,
-            expert_counts_by_rank.to(dtype=torch.long),
-            reverse_map_indices,
-            sorted_weights,
-            (B, T),
-        )
-
-    def dispatch_exchange(self, permuted_data, send_rank_counts, send_expert_counts):
-        """
-        Stage 2: Communication (All-to-All)
-        """
-        if self.world_size == 1:
-            # Local only: Just sum the counts to get tokens per expert
-            local_tokens_per_expert = send_expert_counts.view(-1).tolist()
-            return (
-                permuted_data,
-                send_rank_counts.tolist(),
-                send_rank_counts.tolist(),
-                local_tokens_per_expert,
-            )
-
-        # 1. METADATA EXCHANGE (Blocking)
-        # We need to know how many tokens we receive for EACH of our local experts.
-        # send_expert_counts: [WS, Local_Experts]
-        recv_expert_counts = torch.empty_like(send_expert_counts)
-        dist.all_to_all_single(recv_expert_counts, send_expert_counts, group=self.group)
-
-        # Collapse: Sum across all ranks to get total tokens for each of MY local experts
-        # [WS, Local_Experts] -> [Local_Experts]
-        tokens_per_local_expert = recv_expert_counts.sum(dim=0).tolist()
-
-        # 2. DATA EXCHANGE
-        # Standard logic for the heavy payload
-        recv_rank_counts = torch.empty_like(send_rank_counts)
-        dist.all_to_all_single(recv_rank_counts, send_rank_counts, group=self.group)
-
-        send_list = send_rank_counts.tolist()
-        recv_list = recv_rank_counts.tolist()
-        total_recv = sum(recv_list)
-
-        recv_data = torch.empty(
-            total_recv, self.dim, device=permuted_data.device, dtype=permuted_data.dtype
-        )
-
-        dist.all_to_all_single(
-            recv_data,
-            permuted_data,
-            output_split_sizes=recv_list,
-            input_split_sizes=send_list,
-            group=self.group,
-        )
-
-        return recv_data, recv_list, send_list, tokens_per_local_expert
-
-    def compute_experts(self, recv_data, tokens_per_expert: list[int]) -> torch.Tensor:
-        """
-        Stage 3: Computation
-        """
-        #
-        # We now use the exchanged metadata (tokens_per_expert) to correctly split the buffer.
-
-        # Validating the sum matches the data received
-        # (In a real optimized kernel, we'd skip this check or do it async)
-        # assert sum(tokens_per_expert) == recv_data.shape[0]
-
-        # Use split instead of chunk
-        chunks = recv_data.split(tokens_per_expert, dim=0)
-
-        results = []
-        for chunk, expert in zip(chunks, self.experts, strict=False):
-            if chunk.shape[0] > 0:
-                results.append(expert(chunk))
-            else:
-                results.append(
-                    torch.empty(0, self.dim, device=recv_data.device, dtype=recv_data.dtype)
-                )
-
-        if not results:
-            return torch.empty(0, self.dim, device=recv_data.device, dtype=recv_data.dtype)
-
-        return torch.cat(results, dim=0)
-
-    def combine_exchange(self, expert_output, recv_splits, send_splits):
-        """
-        Stage 4: Reverse Communication
-        """
-        if self.world_size == 1:
-            return expert_output
-
-        if isinstance(send_splits, torch.Tensor):
-            send_splits = send_splits.tolist()
-
-        total_back = sum(send_splits)
-        final_data = torch.empty(
-            total_back, self.dim, device=expert_output.device, dtype=expert_output.dtype
-        )
-
-        dist.all_to_all_single(
-            final_data,
-            expert_output,
-            output_split_sizes=send_splits,
-            input_split_sizes=recv_splits,
-            group=self.group,
-        )
-        return final_data
-
-    def unpermute(self, x_out, reverse_map_indices, sorted_weights, original_shape) -> torch.Tensor:
-        """Stage 5: Local Un-permute and Scatter"""
-        B, T = original_shape
-        D = self.dim
-
-        if self.implementation == consts.MoEImplementation.STANDARD:
-            x_out = x_out * sorted_weights.unsqueeze(-1)
-            out = torch.zeros(B * T, D, device=x_out.device, dtype=x_out.dtype)
-            out.index_add_(0, reverse_map_indices, x_out)
-            return out.view(B, T, D)
-
-        elif self.implementation == consts.MoEImplementation.FAST:
-            # Fast Kernel
-            out = grouped_weighted_scatter_add(
-                [x_out], reverse_map_indices, sorted_weights, (B * T, D)
-            )
-            return out.view(B, T, D)
-
-        raise NotImplementedError
+        self.norm = nn.LayerNorm(hidden_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        permuted, send_rank_counts, send_exp_counts, rev_idx, weights, shape = self.gate_and_sort(x)
-        # Updated to catch the extra return value (tokens_per_expert)
-        recv_data, recv_splits, send_splits_list, tokens_per_expert = self.dispatch_exchange(
-            permuted, send_rank_counts, send_exp_counts
-        )
-        expert_out = self.compute_experts(recv_data, tokens_per_expert)
-        final_data = self.combine_exchange(expert_out, recv_splits, send_splits_list)
-        return self.unpermute(final_data, rev_idx, weights, shape)
+        # Input Shape: [Batch, SeqLen, HiddenDim]
+        B, S, D = x.shape
+        residual = x
+        x = self.norm(x)
+
+        # Projections & Reshape for Multi-head
+        # View: [B, S, NumHeads, HeadDim] -> Transpose: [B, NumHeads, S, HeadDim]
+        q = self.q_proj(x).view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+
+        # Reassemble heads
+        out = out.transpose(1, 2).contiguous().view(B, S, D)
+        out = self.o_proj(out)
+
+        return out + residual
 
 
-# ======== Transformer Blocks ======== #
-class Block(nn.Module):
-    def __init__(self, dim: int, n_heads: int, ff_dim: int) -> None:
+class Expert(nn.Module):
+    """
+    A single Expert (FFN). In production (DeepSeek/Mixtral), this would often be a SwiGLU.
+    """
+
+    def __init__(self, dim: int, proj_dim: int) -> None:
         super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.attn = MultiheadSelfAttention(dim, n_heads)
-        self.norm2 = nn.LayerNorm(dim)
-        self.ff = FeedForward(dim=dim, ff_dim=ff_dim)
 
-    def forward(self, x):
-        x = x + self.attn(self.norm1(x))
-        x = x + self.ff(self.norm2(x))
-        return x
+        # Assertion ensures we adhere to expansion ratios typical in Transformers (e.g. 4x or 8/3x)
+        assert proj_dim > dim, "Projection Dimensions should be larger than dimension"
+
+        self.fc1 = nn.Linear(dim, proj_dim)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(proj_dim, dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [Num_Tokens_Assigned_To_This_Expert, HiddenDim]
+        return self.fc2(self.act(self.fc1(x)))
 
 
-class MoEBlock(nn.Module):
+# ==========================================
+# Configurable PipeLine Block (Shared Streams)
+# ==========================================
+class PipelineMoEBlock(nn.Module):
+    """
+    Implements the PipeLined MoE Block with N-micro-batches..
+
+    The core idea is to break the dependency chain [Attn -> MoE -> Attn] by
+    micro-batching. While we wait for the MoE communication (All-to-All) of MicroBatch `i`,
+    we can compute the Attention (Pre/Post Ops) of MicroBatch `i+1` (or `i-1` depending on stage).
+
+    Streams:
+        - COMPUTE: Handles Pre-Ops (Gate, Attn L), MoE, and Post-Ops (Attn L+1).
+        - COMM: Handles the heavy All-to-All transfers (Dispatch/Combine).
+    """
+
     def __init__(
         self,
-        dim: int,
-        n_heads: int,
-        ff_dim: int,
-        num_experts: int,
-        top_k: int,
-        implementation: consts.MoEImplementation,
+        cfg: Config,
+        group: dist.ProcessGroup,
+        block_name: str,
+        pre_op_module: SelfAttention | None,
+        post_op_module: SelfAttention | nn.Linear | None,
+        streams: dict[Streams, torch.cuda.Stream],
     ) -> None:
         super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.attn = MultiheadSelfAttention(dim, n_heads)
-        self.norm2 = nn.LayerNorm(dim)
+        self.cfg: Config = cfg
+        self.block_name = block_name
+        self.hidden_dim = cfg.moe.hidden_dim
+        # Calculate local experts: Total Experts / World Size
+        self.num_local_experts = cfg.moe.num_experts_per_gpu
+        self.group = group
+        self.world_size = cfg.world_size
 
-        self.ff = MoEFeedForward(
-            dim=dim,
-            ff_dim=ff_dim,
-            num_experts=num_experts,
-            top_k=top_k,
-            implementation=implementation,
+        # Unpack Shared Streams
+        self.stream_compute = streams[Streams.COMPUTE]
+        self.stream_comm = streams[Streams.COMM]
+
+        # Components
+        self.moe_norm = nn.LayerNorm(self.hidden_dim)
+
+        # Pre-Ops: Usually the Self-Attention of the CURRENT layer.
+        self.pre_ops = pre_op_module if pre_op_module else nn.Identity()
+
+        # Gating: Maps tokens to experts.
+        self.gate = nn.Linear(
+            self.hidden_dim, cfg.moe.num_experts_per_gpu * cfg.world_size, bias=False
         )
 
-    def forward(self, x):
-        x = x + self.attn(self.norm1(x))
-        x = x + self.ff(self.norm2(x))
-        return x
+        self.experts = nn.ModuleList(
+            [Expert(self.hidden_dim, cfg.moe.proj_dim) for _ in range(self.num_local_experts)]
+        )
 
+        # Post-Ops: Usually the Self-Attention of the NEXT layer (Lancet Optimization).
+        self.post_ops = post_op_module if post_op_module else nn.Identity()
 
-class PipelinedMoEBlock(nn.Module):
-    def __init__(
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Input: [Batch, Seq, Dim]
+        _, S, D = x.shape
+
+        # 1. Micro-batching: Split input along the Batch dimension.
+        # Why: Smaller chunks allow us to overlap work. While chunk 0 is communicating, chunk 1 computes. # noqa
+        chunks = x.chunk(self.cfg.moe.micro_batches, dim=0)
+
+        # Buffers to hold intermediate tensors alive.
+        # Why: CUDA streams run asynchronously. If we don't hold references in Python,
+        # GC might free the tensor memory while the GPU is still reading it, causing undefined behavior. # noqa
+        pipeline_buffers = [{} for _ in range(self.cfg.moe.micro_batches)]
+        outputs = [None] * self.cfg.moe.micro_batches
+
+        # CUDA Events for Synchronization
+        # We need distinct events for every micro-batch at every stage boundary.
+        ev_pre_ready = [torch.cuda.Event() for _ in range(self.cfg.moe.micro_batches)]
+        ev_dispatch_ready = [torch.cuda.Event() for _ in range(self.cfg.moe.micro_batches)]
+        ev_expert_ready = [torch.cuda.Event() for _ in range(self.cfg.moe.micro_batches)]
+        ev_combine_ready = [torch.cuda.Event() for _ in range(self.cfg.moe.micro_batches)]
+
+        # The Pipeline Loop (5 Stages)
+        # Total ticks = Number of Microbatchess + Pipeline Depth (4)
+        total_ticks = self.cfg.moe.micro_batches + 4
+
+        for tick in range(total_ticks):
+            # Calculate which micro-batch is in which stage at this tick
+            mb_post = tick - 4
+            mb_comb = tick - 3
+            mb_exp = tick - 2
+            mb_disp = tick - 1
+            mb_pre = tick
+
+            # Execute Stages (Reverse order helps conceptualize data flow clearing up, but execution order is async) # noqa
+            self._stage_post_ops(mb_post, pipeline_buffers, outputs, ev_combine_ready, chunks, S, D)
+            self._stage_combine(mb_comb, pipeline_buffers, ev_expert_ready, ev_combine_ready)
+            self._stage_experts(mb_exp, pipeline_buffers, ev_dispatch_ready, ev_expert_ready)
+            self._stage_dispatch(mb_disp, pipeline_buffers, ev_pre_ready, ev_dispatch_ready)
+            self._stage_pre_ops(mb_pre, pipeline_buffers, chunks, ev_pre_ready, D)
+
+        # Final Synchronization:
+        # We must wait for the Compute stream to finish the last Post-Op.
+        # Why: Ensures all `outputs` are populated and valid before returning to the next Python line. # noqa
+        torch.cuda.current_stream().wait_stream(self.stream_compute)
+        return torch.cat(outputs, dim=0)
+
+    # ==========================================
+    # Pipeline Stages (Split Logic)
+    # ==========================================
+
+    # ==========================================
+    # Pipeline Stages (Split Logic)
+    # ==========================================
+
+    def _stage_pre_ops(
         self,
+        mb_idx: int,
+        buffers: list[dict[str, torch.Tensor]],
+        chunks: tuple[torch.Tensor, ...],
+        ev_signal: list[torch.cuda.Event],
         dim: int,
-        n_heads: int,
-        ff_dim: int,
-        num_experts: int,
-        top_k: int,
-        stream0: torch.cuda.Stream,
-        stream1: torch.cuda.Stream,
     ) -> None:
-        super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.attn = MultiheadSelfAttention(dim, n_heads)
-        self.norm2 = nn.LayerNorm(dim)
-        self.moe = MoEFeedForward(
-            dim=dim,
-            ff_dim=ff_dim,
-            num_experts=num_experts,
-            top_k=top_k,
-            implementation=consts.MoEImplementation.FAST,
-        )
-        self.stream0 = stream0
-        self.stream1 = stream1
+        """Stage 1: Pre-Ops + Gating (Compute Stream)"""
+        if 0 <= mb_idx < self.cfg.moe.micro_batches:
+            with torch.cuda.stream(self.stream_compute):
+                # Helper for NVTX visualization
+                is_identity = isinstance(self.pre_ops, nn.Identity)
+                label = f"{self.block_name}_Pre_{'GateOnly' if is_identity else 'Attn'}_MB{mb_idx}"
 
-    def forward(self, x):
-        """
-        DeepSeek-V3 Style Expert Parallelism (Dual-Stream)
+                torch.cuda.nvtx.range_push(label)
+                with record_function(label):
+                    x_chunk = chunks[mb_idx]
 
-        Timeline Goal:
-        Stream 0 (MB0): [Attn 0] [Dispatch 0] [Experts 0] [Combine 0]
-        Stream 1 (MB1):          [Attn 1]     [Dispatch 1] [Experts 1] ...
+                    # 1. Run Pre-Ops (e.g., Layer L Attention)
+                    x_proc = self.pre_ops(x_chunk)
 
-        The 'Gap' in Stream 1 is created by waiting for Attn 0 to finish.
-        This forces:
-          - Dispatch 0 (Comm) || Attn 1 (Compute)
-          - Experts 0 (Compute) || Dispatch 1 (Comm)
-          - Combine 0 (Comm) || Experts 1 (Compute)
-        """
-        x_chunks = x.chunk(2, dim=0)
-        mb0, mb1 = x_chunks[0], x_chunks[1]
+                    # 2. Save Residual for the MoE Add later
+                    # Flatten: [Batch*Seq, Dim] for simpler linear layers
+                    x_flat = x_proc.view(-1, dim)
+                    buffers[mb_idx]["gated_input"] = x_flat.clone()
 
-        # New synchronization event for this pass
-        ev_attn0_done = torch.cuda.Event()
+                    # 3. MoE Pre-Norm (Standard Pre-Norm Architecture)
+                    x_normed = self.moe_norm(x_proc).view(-1, dim)
+                    buffers[mb_idx]["normed_input_flat"] = x_normed
 
-        ctx0, ctx1 = {}, {}
+                    # 4. Gating
+                    logits = self.gate(x_normed)
 
-        # =========================================================================
-        # Stream 0: Micro-Batch 0 (The Leader)
-        # =========================================================================
-        with torch.cuda.stream(self.stream0):
-            # A. Attention
-            with record_function("S0: Attn 0"):
-                h0 = self.norm1(mb0)
-                h0 = self.attn(h0)
-                mb0_resid = mb0 + h0
-                moe_in_0 = self.norm2(mb0_resid)
-                # Now returns extra expert_counts
-                perm0, sc0, exp_c0, rev0, w0, s0 = self.moe.gate_and_sort(moe_in_0)
-                ctx0.update({"rev": rev0, "w": w0, "s": s0})
+                    # Why TopK? Even if we don't permute in this simulation, calculating TopK
+                    # incurs computational cost (sorting) which affects the timeline.
+                    # In a full implementation, these indices would drive torch.scatter/gather.
+                    _, _ = torch.topk(logits, k=self.cfg.moe.top_k, dim=1)
 
-            ev_attn0_done.record()
+                torch.cuda.nvtx.range_pop()
 
-            # B. Dispatch
-            with record_function("S0: Dispatch 0"):
-                # Pass both rank_counts and expert_counts
-                rd0, rc0, sl0, tpe0 = self.moe.dispatch_exchange(perm0, sc0, exp_c0)
-                ctx0.update({"rd": rd0, "rc": rc0, "sl": sl0, "tpe": tpe0})
+            # Signal that Pre-Ops are done for this MB
+            ev_signal[mb_idx].record(self.stream_compute)
 
-            # C. Experts
-            with record_function("S0: Experts 0"):
-                # Use the received tokens_per_expert (tpe)
-                eo0 = self.moe.compute_experts(ctx0["rd"], ctx0["tpe"])
-                del ctx0["rd"]
+    def _stage_dispatch(
+        self,
+        mb_idx: int,
+        buffers: list[dict[str, torch.Tensor]],
+        ev_wait: list[torch.cuda.Event],
+        ev_signal: list[torch.cuda.Event],
+    ) -> None:
+        """Stage 2: Dispatch All-to-All (Comm Stream)"""
+        if 0 <= mb_idx < self.cfg.moe.micro_batches:
+            buf = buffers[mb_idx]
+            # Wait for data from Pre-Ops
+            self.stream_comm.wait_event(ev_wait[mb_idx])
 
-            # D. Combine
-            with record_function("S0: Combine 0"):
-                fd0 = self.moe.combine_exchange(eo0, ctx0["rc"], ctx0["sl"])
-                del eo0
+            with torch.cuda.stream(self.stream_comm):
+                label = f"{self.block_name}_Dispatch_MB{mb_idx}"
+                torch.cuda.nvtx.range_push(label)
+                with record_function(label):
+                    real_in = buf["normed_input_flat"]
 
-            # E. Finalize
-            with record_function("S0: Finalize 0"):
-                res0 = self.moe.unpermute(fd0, ctx0["rev"], ctx0["w"], ctx0["s"])
-                out0 = res0 + mb0_resid
-                del ctx0
+                    # Simulation: Repeat data to bloat communication size.
+                    # Why: Real MoE dispatch sends sparse, shuffled data. Here we send dense copies
+                    # to match the timing of a real heavy transfer without implementing the shuffle logic. # noqa
+                    bloated_in = real_in.repeat(1, self.cfg.moe.comm_scaling_factor)
+                    bloated_out = torch.empty_like(bloated_in)
 
-        # =========================================================================
-        # Stream 1: Micro-Batch 1 (The Follower)
-        # =========================================================================
-        with torch.cuda.stream(self.stream1):
-            # STAGGER
-            self.stream1.wait_event(ev_attn0_done)
+                    dist.all_to_all_single(
+                        bloated_out,
+                        bloated_in,
+                        group=self.group,
+                        async_op=False,
+                    )
+                    # In reality, this output would be the shuffled tokens received from peers.
+                    buffers[mb_idx]["dispatch_output"] = torch.empty_like(real_in)
 
-            # A. Attention
-            with record_function("S1: Attn 1"):
-                h1 = self.norm1(mb1)
-                h1 = self.attn(h1)
-                mb1_resid = mb1 + h1
-                moe_in_1 = self.norm2(mb1_resid)
-                perm1, sc1, exp_c1, rev1, w1, s1 = self.moe.gate_and_sort(moe_in_1)
-                ctx1.update({"rev": rev1, "w": w1, "s": s1})
+                torch.cuda.nvtx.range_pop()
+            ev_signal[mb_idx].record(self.stream_comm)
 
-            # B. Dispatch
-            with record_function("S1: Dispatch 1"):
-                rd1, rc1, sl1, tpe1 = self.moe.dispatch_exchange(perm1, sc1, exp_c1)
-                ctx1.update({"rd": rd1, "rc": rc1, "sl": sl1, "tpe": tpe1})
+    def _stage_experts(
+        self,
+        mb_idx: int,
+        buffers: list[dict[str, torch.Tensor]],
+        ev_wait: list[torch.cuda.Event],
+        ev_signal: list[torch.cuda.Event],
+    ) -> None:
+        """Stage 3: Expert Computation (Expert Stream)"""
+        if 0 <= mb_idx < self.cfg.moe.micro_batches:
+            buf = buffers[mb_idx]
+            # Wait for data from Dispatch
+            self.stream_compute.wait_event(ev_wait[mb_idx])
 
-            # C. Experts
-            with record_function("S1: Experts 1"):
-                eo1 = self.moe.compute_experts(ctx1["rd"], ctx1["tpe"])
-                del ctx1["rd"]
+            with torch.cuda.stream(self.stream_compute):
+                label = f"{self.block_name}_Experts_MB{mb_idx}"
+                torch.cuda.nvtx.range_push(label)
+                with record_function(label):
+                    inp = buf["dispatch_output"]
+                    # Split input among local experts (e.g. 2 experts per GPU)
+                    splits = inp.chunk(self.num_local_experts)
+                    # Serial execution of experts on this stream
+                    res = [self.experts[i](splits[i]) for i in range(self.num_local_experts)]
+                    buf["expert_output"] = torch.cat(res)
 
-            # D. Combine
-            with record_function("S1: Combine 1"):
-                fd1 = self.moe.combine_exchange(eo1, ctx1["rc"], ctx1["sl"])
-                del eo1
+                torch.cuda.nvtx.range_pop()
+            ev_signal[mb_idx].record(self.stream_compute)
 
-            # E. Finalize
-            with record_function("S1: Finalize 1"):
-                res1 = self.moe.unpermute(fd1, ctx1["rev"], ctx1["w"], ctx1["s"])
-                out1 = res1 + mb1_resid
-                del ctx1
+    def _stage_combine(
+        self,
+        mb_idx: int,
+        buffers: list[dict[str, torch.Tensor]],
+        ev_wait: list[torch.cuda.Event],
+        ev_signal: list[torch.cuda.Event],
+    ) -> None:
+        """Stage 4: Combine All-to-All (Comm Stream)"""
+        if 0 <= mb_idx < self.cfg.moe.micro_batches:
+            buf = buffers[mb_idx]
+            # Wait for Experts to finish
+            self.stream_comm.wait_event(ev_wait[mb_idx])
 
-        torch.cuda.current_stream().wait_stream(self.stream0)
-        torch.cuda.current_stream().wait_stream(self.stream1)
-        return torch.cat([out0, out1], dim=0)
+            with torch.cuda.stream(self.stream_comm):
+                label = f"{self.block_name}_Combine_MB{mb_idx}"
+                torch.cuda.nvtx.range_push(label)
+                with record_function(label):
+                    real_in = buf["expert_output"]
+
+                    # Dead weight injection again for Combine phase
+                    bloated_in = real_in.repeat(1, self.cfg.moe.comm_scaling_factor)
+                    bloated_out = torch.empty_like(bloated_in)
+
+                    dist.all_to_all_single(
+                        bloated_out,
+                        bloated_in,
+                        group=self.group,
+                        async_op=False,
+                    )
+                    buf["combined_output"] = torch.empty_like(real_in)
+
+                torch.cuda.nvtx.range_pop()
+            ev_signal[mb_idx].record(self.stream_comm)
+
+    def _stage_post_ops(
+        self,
+        mb_idx: int,
+        buffers: list[dict[str, torch.Tensor]],
+        outputs: list[torch.Tensor | None],
+        ev_wait: list[torch.cuda.Event],
+        chunks: tuple[torch.Tensor, ...],
+        seq_len: int,
+        dim: int,
+    ) -> None:
+        """Stage 5: Post-Ops & Residual (Compute Stream)"""
+        if 0 <= mb_idx < self.cfg.moe.micro_batches:
+            buf = buffers[mb_idx]
+            # Wait for Combine to finish
+            self.stream_compute.wait_event(ev_wait[mb_idx])
+
+            with torch.cuda.stream(self.stream_compute):
+                op_name = self.post_ops.__class__.__name__
+                label = f"{self.block_name}_Post_{op_name}_MB{mb_idx}"
+
+                torch.cuda.nvtx.range_push(label)
+                with record_function(label):
+                    # 1. Residual Connection
+                    # Equation: x + MoE(Norm(x))
+                    moe_out = buf["combined_output"]
+                    residual = buf["gated_input"]
+                    post_moe_out = residual + moe_out
+
+                    # 2. Reshape back to Sequence for Attention: [Batch, Seq, Dim]
+                    mb_size = chunks[mb_idx].size(0)
+                    reshaped_in = post_moe_out.view(mb_size, seq_len, dim)
+
+                    # 3. Next Layer Ops
+                    # This computes Layer L+1 Attention while Layer L comms are happening
+                    outputs[mb_idx] = self.post_ops(reshaped_in)
+
+                torch.cuda.nvtx.range_pop()
 
 
+# ==========================================
+# N-Block Tiny Model
+# ==========================================
 class TinyModel(nn.Module):
     def __init__(
         self,
-        in_dim: int,
-        dim: int,
-        n_heads: int,
-        ff_dim: int,
-        n_layers: int,
-        num_experts: int | None,
-        top_k: int | None,
-        implementation: consts.MoEImplementation | None,
-        stream0: torch.cuda.Stream | None,
-        stream1: torch.cuda.Stream | None,
-        *,
-        use_moe: bool,
-    ):
+        cfg: Config,
+        group: dist.ProcessGroup,
+    ) -> None:
         super().__init__()
-        self.inp = nn.Linear(in_dim, dim, bias=False)
+        self.cfg = cfg
+        self.hidden_dim = cfg.moe.hidden_dim
 
-        if not use_moe:
-            self.blocks = nn.ModuleList(
-                [Block(dim=dim, n_heads=n_heads, ff_dim=ff_dim) for _ in range(n_layers)]
-            )
-        elif implementation == consts.MoEImplementation.STANDARD:
-            self.blocks = nn.ModuleList(
-                [
-                    MoEBlock(
-                        dim=dim,
-                        n_heads=n_heads,
-                        ff_dim=ff_dim,
-                        num_experts=num_experts,
-                        top_k=top_k,
-                        implementation=implementation,
-                    )
-                    for _ in range(n_layers)
-                ]
-            )
-        elif implementation == consts.MoEImplementation.FAST:
-            self.blocks = nn.ModuleList(
-                [
-                    PipelinedMoEBlock(
-                        dim=dim,
-                        n_heads=n_heads,
-                        ff_dim=ff_dim,
-                        num_experts=num_experts,
-                        top_k=top_k,
-                        stream0=stream0,
-                        stream1=stream1,
-                    )
-                    for _ in range(n_layers)
-                ]
-            )
-        else:
-            raise NotImplementedError
+        # Input Projection
+        self.input_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
 
-        self.out = nn.Linear(dim, in_dim, bias=False)
+        # Get the shared streams (Compute, Comm, Expert)
+        self.streams: dict[Streams, torch.cuda.Stream] = get_ep_streams()
+        self.blocks = nn.ModuleList()
 
-    def forward(self, x):
-        x = self.inp(x)
-        for b in self.blocks:
-            x = b(x)
-        return self.out(x)
+        # Dynamic Block Construction
+        # We implement the "Micro Batch Chain" where Block N computes Pre=Identity, Post=Attn(N+1).
+        # Structure:
+        # Block 0:   Pre=Attn(0), MoE(0), Post=Attn(1)
+        # Block 1:   Pre=None,    MoE(1), Post=Attn(2)
+        # ...
+        # Block N-1: Pre=None,    MoE(N-1), Post=Linear(Out)
+
+        for i in range(cfg.moe.n_blocks):
+            # Pre-Op Logic:
+            # Only the first block (i=0) needs to run its own Attention.
+            # Subsequent blocks receive the output of Attn(i) which was computed in Block(i-1)'s Post-Op. # noqa
+            if i == 0:
+                pre_module = SelfAttention(self.hidden_dim, cfg.moe.num_heads)
+            else:
+                pre_module = None  # Becomes nn.Identity inside the block
+
+            # Post-Op Logic:
+            # Blocks 0 to N-2 compute the *next* block's Attention.
+            # The final block (N-1) computes the final Linear layer (or Identity if no head).
+            if i < cfg.moe.n_blocks - 1:
+                post_module = SelfAttention(self.hidden_dim, cfg.moe.num_heads)
+            else:
+                # Final block post-op: Project to output or next stage
+                post_module = nn.Linear(self.hidden_dim, self.hidden_dim)
+
+            block = PipelineMoEBlock(
+                cfg,
+                group,
+                block_name=f"B{i}",
+                pre_op_module=pre_module,
+                post_op_module=post_module,
+                streams=self.streams,
+            )
+            self.blocks.append(block)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.input_proj(x)
+
+        for block in self.blocks:
+            x = block(x)
+
+        return x
