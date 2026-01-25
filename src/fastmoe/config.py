@@ -3,80 +3,105 @@ import sys
 from enum import Enum
 
 from loguru import logger
+from pydantic import Field
 from pydantic_settings import BaseSettings
 
 
 class MoEScale(str, Enum):
-    DEBUG = "debug"
-    GIGACHAT_10B = "gigachat-10b"
-    GIGACHAT_700B = "gigachat-700b"
+    TINY = "tiny"
+    CI = "ci"  # CI scale for GitHub Actions
 
 
 class MoESetup(BaseSettings):
-    scale: MoEScale = MoEScale.DEBUG
-    batch_size: int = 4
-    seq_len: int = 4096
+    scale: MoEScale = MoEScale.TINY
+
+    # Model
+    n_blocks: int = 2
+    batch_size: int = 128
+    proj_dim: int = 4 * 4096
     hidden_dim: int = 4096
+    num_heads: int = 32
+    seqlen: int = 128
 
-    num_experts: int = 8
+    # Experts
+    num_experts_per_gpu: int = 2
     top_k: int = 2
-    warmup_steps: int = 10
-    active_steps: int = 50
 
-    @property
-    def total_tokens(self) -> int:
-        return self.batch_size * self.seq_len * self.top_k
+    micro_batches: int = 2
 
-    @property
-    def activation_volume_mb(self) -> float:
-        """Size of the tensor being recombined in MB (Float32)"""
-        # B * T * TopK * Hidden * 4 bytes
-        return (self.total_tokens * self.hidden_dim * 4) / (1024**2)
+    # Steps
+    warmup_steps: int = 5
+    active_steps: int = 3
+
+    comm_scaling_factor: int = 20
 
 
 class Config(BaseSettings):
-    moe: MoESetup = MoESetup()
-    logs_dir: str = "logs"
-    log_level: str = "INFO"
+    moe: MoESetup
+    world_size: int
+
+    # Defaults
+    logs_dir: str = Field(default="logs")
+    log_level: str = Field(default="INFO")
 
     class Config:
         extra = "ignore"
 
-
-def get_config(scale: MoEScale = MoEScale.DEBUG) -> MoESetup:
-    """Factory for GigaChat MoE configurations"""
-
-    if scale == MoEScale.DEBUG:
-        return MoESetup(
-            scale=MoEScale.DEBUG, batch_size=2, seq_len=128, hidden_dim=512, num_experts=4, top_k=2
+    def __repr__(self) -> str:
+        """Produces a structured, readable log message for startup."""
+        return (
+            f"\n{'='*50}\n"
+            f"               FastMoE Configuration\n"
+            f"{'='*50}\n"
+            f"System:\n"
+            f"  • World Size       : {self.world_size}\n"
+            f"  • Log Level        : {self.log_level}\n"
+            f"  • Logs Dir         : {self.logs_dir}\n\n"
+            f"Model (Scale: {self.moe.scale.value}):\n"
+            f"  • Layers           : {self.moe.n_blocks}\n"
+            f"  • Hidden Dim       : {self.moe.hidden_dim}\n"
+            f"  • Attention Heads  : {self.moe.num_heads}\n"
+            f"  • Sequence Length  : {self.moe.seqlen}\n\n"
+            f"MoE & Training:\n"
+            f"  • Experts per GPU  : {self.moe.num_experts_per_gpu}\n"
+            f"  • Global Batch     : {self.moe.batch_size}\n"
+            f"  • Micro Batches    : {self.moe.micro_batches}\n"
+            f"  • Top-K            : {self.moe.top_k}\n"
+            f"  • Comm. Scaling    : {self.moe.comm_scaling_factor}x (Simulation)\n"
+            f"{'='*50}"
         )
 
-    elif scale == MoEScale.GIGACHAT_10B:
+
+def get_moe_config(scale: MoEScale = MoEScale.TINY) -> MoESetup:
+    """Factory MoE configurations"""
+
+    if scale == MoEScale.TINY:
+        return MoESetup()
+
+    # Toy configuration that fits in <2GB RAM for CI testing
+    if scale == MoEScale.CI:
         return MoESetup(
-            scale=MoEScale.GIGACHAT_10B,
-            batch_size=4,  # Micro-batch per GPU
-            seq_len=4096,  # Standard context
-            hidden_dim=4096,  # Standard 7B-10B model width
-            num_experts=8,  # 8 Experts
-            top_k=2,
+            scale=MoEScale.CI,
+            hidden_dim=64,
+            proj_dim=4 * 64,
+            num_heads=4,
+            batch_size=8,
+            seqlen=32,
+            warmup_steps=1,
+            active_steps=1,
+            comm_scaling_factor=1,
         )
 
-    elif scale == MoEScale.GIGACHAT_700B:
-        return MoESetup(
-            scale=MoEScale.GIGACHAT_700B,
-            batch_size=2,  # Reduced due to memory pressure
-            seq_len=4096,
-            hidden_dim=16384,  # Massive width
-            num_experts=256,  # Extreme fragmentation
-            top_k=4,  # Higher Top-K common at this scale
-        )
-
-    return MoESetup()
+    raise NotImplementedError
 
 
 @functools.lru_cache
-def init_app() -> Config:
-    cfg = Config()
+def get_cfg(world_size: int, scale: MoEScale) -> Config:
+    cfg = Config(
+        moe=get_moe_config(scale),
+        world_size=world_size,
+    )
+
     logger.remove()
     logger.add(
         sys.stderr,

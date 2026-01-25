@@ -118,25 +118,26 @@ Speed is useless without accuracy. We implemented a strict numerical verificatio
 
 ## 6. Expert Parallel
 
-Hybrid Pipelining: We keep the Attention mechanism on the full batch to maximize Tensor Core utilization. We only pipeline the MoE block, splitting the input into two micro-batches.
+**Hybrid Pipelining Strategy:** To address the significant communication overhead of All-to-All operations in MoE models, we implement the **Micro-Batch Pipelined"** strategy. Instead of treating the MoE block in isolation, we pipeline it together with the subsequent non-MoE layers (e.g., the next layer's Attention).
 
-**Overlap Schedule:**
+**Key Idea:**
+We split the batch into micro-batches. While one micro-batch is stalled on communication (dispatch/combine), the GPU is kept busy computing the dense operations (Attention/FFN) for another micro-batch of the *next layer*. This effectively "pulls" future compute work backward to fill the communication bubbles of the current layer.
 
-- While Micro-batch 1 is performing its all-to-all dispatch, Micro-batch 2 is being gated.
+**Overlap Schedule (5-Stage Pipeline):**
 
-- While Micro-batch 1 is computing experts, Micro-batch 2 is performing its all-to-all dispatch.
+1.  **Pre-Ops (Compute Stream):** Compute Attention and Gating for Micro-batch $N$ (Layer $L$).
+2.  **Dispatch (Comm Stream):** Send tokens for Micro-batch $N$ to correct experts.
+3.  **Experts (Expert Stream):** Compute Experts for Micro-batch $N$.
+4.  **Combine (Comm Stream):** Gather results for Micro-batch $N$.
+5.  **Post-Ops (Compute Stream):** Compute **Attention for Layer $L+1$** using the results of Micro-batch $N$. This overlaps perfectly with the `Combine` communication of the next micro-batch.
 
-- While Micro-batch 1 is performing its all-to-all combine, Micro-batch 2 is computing experts.
+**Profiling Verification:**
 
-**Profiling:** Below are the Chrome Traces visualizing the execution.
+Below are Chrome Traces from our implementation visualizing this overlap. You can see the characteristic "staircase" pattern where Communication (green) runs in parallel with Expert Compute (blue) and Next-Layer Attention (purple).
 
-The common attention compute:
 
-![Common attention compute](assets/attention.png)
-
-Followed by the "Experts" compute blocks overlapping perfectly with the "all_to_all" communication blocks, removing idle time:
-
-![Pipelined MoE compute](assets/gate_and_experts.png)
+* **Pipelined Execution:** The "Experts" compute blocks and "Next Layer Attention" blocks overlap perfectly with the "all_to_all" communication blocks, virtually eliminating idle time.
+    ![Pipelined MoE compute vs comm](assets/compute_vs_comm_overlap.jpg)
 
 ---
 

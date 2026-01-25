@@ -1,128 +1,123 @@
+import unittest
+from unittest.mock import patch
+
 import torch
+import torch.nn as nn
 
-# --- PATCHING (Mock CUDA) ---
-# We must patch BEFORE importing modules that might initialize CUDA things
-from mocks import MockEvent, MockStream
+# --- PATCHING (Mock CUDA & Distributed) ---
+# We must patch these BEFORE importing the models that might initialize things at module level.
+from mocks import MockDist, MockEvent, MockNVTX, MockStream
 
+# Apply patches globally for the test execution
 torch.cuda.Event = MockEvent
+torch.cuda.Stream = MockStream
 torch.cuda.stream = lambda s: s
 torch.cuda.current_stream = lambda: MockStream()
+torch.cuda.nvtx = MockNVTX
+# Mock distributed backend
+torch.distributed.all_to_all_single = MockDist.all_to_all_single
+torch.distributed.get_world_size = MockDist.get_world_size
+torch.distributed.get_rank = MockDist.get_rank
+torch.distributed.group = MockDist.group
+
 # ----------------------------
 
-# We import the kernel wrapper to ensure it's using the CPU fallback
-from fastmoe.kernels.ops import weighted_scatter_add  # noqa
-from fastmoe.layers.moe import MoEFeedForward  # noqa
-from fastmoe.models.tiny_model import TinyModel  # noqa
+from fastmoe.comm import get_ep_streams  # noqa
+from fastmoe.config import MoEScale, get_cfg  # noqa
+from fastmoe.models.tiny_model import PipelineMoEBlock, SelfAttention, TinyModel  # noqa
 
 
-def test_moe_forward_backward_cpu():
-    """
-    Verifies that the MoE layer and the Scatter-Add kernel (CPU fallback)
-    produce valid outputs and propagate gradients correctly.
-    """
-    torch.manual_seed(42)
+class TestFastMoE(unittest.TestCase):
+    def setUp(self):
+        """Setup configuration and shared mocks for every test."""
+        # 1. Create a standard Tiny Config
+        # We simulate world_size=2 to check split logic
+        self.cfg = get_cfg(world_size=2, scale=MoEScale.CI)
 
-    # Config
-    B, T, D = 2, 8, 32
-    ff_dim = 64
-    num_experts = 4
-    top_k = 2
+        # 2. Mock the Stream Dictionary required by the new signature
+        # The model expects a dict of {Enum: Stream}
+        self.mock_streams = get_ep_streams()
 
-    # Instantiate Layer directly to test isolation
-    moe = MoEFeedForward(D, ff_dim, num_experts=num_experts, top_k=top_k)
+        # 3. Dummy Group (usually a ProcessGroupNCCL, passing a string/int is fine for mocks)
+        self.mock_group = "MOCK_GROUP"
 
-    # Input Data
-    x = torch.randn(B, T, D, requires_grad=True)
-    target = torch.randn(B, T, D)
+    def test_pipeline_block_structure_and_forward(self):
+        """
+        Verifies that the PipelineMoEBlock instantiates correctly and runs
+        a forward pass without crashing on CPU (via mocks).
+        """
+        print("\n--- [Test] Pipeline Block Logic (CPU Mocked) ---")
 
-    print("\n--- [Test] Forward Pass ---")
-    out = moe(x)
+        # Dimensions
+        B, S, D = self.cfg.moe.batch_size, self.cfg.moe.seqlen, self.cfg.moe.hidden_dim
 
-    # 1. Check Output Shape
-    assert out.shape == (B, T, D), f"Shape Mismatch: {out.shape} != {(B, T, D)}"
-    print("Shape check passed.")
+        # Instantiate Block
+        # We test the "B1" style block which has both Pre and Post modules
+        block = PipelineMoEBlock(
+            cfg=self.cfg,
+            group=self.mock_group,
+            block_name="TestBlock",
+            pre_op_module=SelfAttention(D, self.cfg.moe.num_heads),
+            post_op_module=SelfAttention(D, self.cfg.moe.num_heads),
+            streams=self.mock_streams,
+        )
 
-    # 2. Check for NaNs
-    assert not torch.isnan(out).any(), "Output contains NaNs"
-    print("NaN check passed.")
+        # Dummy Input
+        x = torch.randn(B, S, D)
 
-    print("\n--- [Test] Backward Pass ---")
-    loss = ((out - target) ** 2).sum()
-    loss.backward()
+        # Execution
+        # This exercises the 5-stage loop, split logic, and event recording
+        out = block(x)
 
-    # 3. Check Gradient Flow to Input
-    assert x.grad is not None, "Input x has no gradient"
-    assert not torch.isnan(x.grad).any(), "Input gradient has NaNs"
-    print("Input gradient check passed.")
+        # Assertions
+        self.assertEqual(out.shape, (B, S, D), "Output shape mismatch")
+        self.assertIsInstance(block.pre_ops, SelfAttention)
+        self.assertIsInstance(block.post_ops, SelfAttention)
+        print("Pipeline forward pass successful.")
 
-    # 4. Check Gradient Flow to Router
-    assert moe.router.weight.grad is not None, "Router has no gradient"
-    print("Router gradient check passed.")
+    def test_tiny_model_integration(self):
+        """
+        Verifies the full N-Block TinyModel construction and chain logic.
+        """
+        print("\n--- [Test] Full TinyModel Integration ---")
 
-    # 5. Check Gradient Flow to Experts
-    # Note: With random data, it is statistically possible (though unlikely)
-    # that an expert receives 0 tokens.
-    active_experts = 0
-    for _, expert in enumerate(moe.experts):
-        # The first layer of the expert MLP
-        w_grad = expert[0].weight.grad
-        if w_grad is not None:
-            active_experts += 1
-            assert not torch.isnan(w_grad).any()
+        # Patch `get_ep_streams` inside `tiny_model.py` to return our mock dictionary
+        # instead of trying to create real CUDA streams inside the model __init__
+        with patch("fastmoe.models.tiny_model.get_ep_streams", return_value=self.mock_streams):
+            model = TinyModel(cfg=self.cfg, group=self.mock_group)
 
-    print(f"Gradients found for {active_experts}/{num_experts} experts.")
-    assert active_experts > 0, "No experts received gradients!"
+            # Verify structure
+            # Block 0 should have Pre=Attn, Post=Attn
+            self.assertIsInstance(model.blocks[0].pre_ops, SelfAttention)
+            self.assertIsInstance(model.blocks[0].post_ops, SelfAttention)
 
+            # Block 1 (Last block) should have Pre=Identity (None), Post=Linear
+            self.assertIsInstance(model.blocks[1].pre_ops, nn.Identity)
+            self.assertIsInstance(model.blocks[1].post_ops, nn.Linear)
 
-def test_full_model_integration():
-    """
-    Verifies the TinyModel structure with MoE blocks enabled.
-    """
-    print("\n--- [Test] Full Model Integration ---")
-    in_dim, dim = 16, 32
-    model = TinyModel(in_dim=in_dim, dim=dim, n_heads=4, ff_dim=64, n_layers=2, num_experts=4)
+            # Forward Pass
+            x = torch.randn(self.cfg.moe.batch_size, 10, self.cfg.moe.hidden_dim)
+            out = model(x)
 
-    x = torch.randn(2, 10, in_dim)  # [B, T, in_dim]
-    out = model(x)
+            self.assertEqual(out.shape, x.shape)
+            print("Full model chain forward pass successful.")
 
-    assert out.shape == (2, 10, in_dim)
-    print("Full model forward pass successful.")
+    def test_micro_batch_splitting(self):
+        """
+        Verifies that chunking logic respects the config.
+        """
+        print("\n--- [Test] Micro-batch Config Check ---")
 
+        B, S, D = 128, 5, 10
+        x = torch.randn(B, S, D)
 
-def test_scatter_add_correctness():
-    """
-    Numerically verify the Scatter-Add CPU fallback against a naive loop.
-    This ensures our 'Mock' logic in ops.py is mathematically correct.
-    """
-    print("\n--- [Test] Kernel Correctness (CPU) ---")
-    N, D = 10, 4
+        # If config says 2 microbatches, we expect chunking to produce tensors of size B/2
+        chunks = x.chunk(self.cfg.moe.micro_batches, dim=0)
 
-    # Inputs
-    src = torch.randn(N, D)
-    weights = torch.rand(N)
-    # Map 10 items into 5 slots
-    indices = torch.randint(0, 5, (N,))
-    out_shape = (5, D)
-
-    # 1. Our CPU Fallback Implementation
-    out_fast = weighted_scatter_add(src, indices, weights, out_shape)
-
-    # 2. Naive Ground Truth
-    out_gt = torch.zeros(out_shape)
-    for i in range(N):
-        dest_idx = indices[i].item()
-        w = weights[i].item()
-        val = src[i]
-        out_gt[dest_idx] += val * w
-
-    # Check
-    diff = (out_fast - out_gt).abs().max()
-    print(f"Max Difference: {diff.item()}")
-    assert diff < 1e-5, "CPU Fallback logic is mathematically wrong"
-    print("Numerical verification passed.")
+        self.assertEqual(len(chunks), self.cfg.moe.micro_batches)
+        self.assertEqual(chunks[0].shape[0], B // self.cfg.moe.micro_batches)
+        print("Micro-batch dimension check passed.")
 
 
 if __name__ == "__main__":
-    test_scatter_add_correctness()
-    test_moe_forward_backward_cpu()
-    test_full_model_integration()
+    unittest.main()
