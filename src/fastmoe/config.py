@@ -47,6 +47,30 @@ class Config(BaseSettings):
     class Config:
         extra = "ignore"
 
+    def __str__(self) -> str:
+        """Produces a structured, readable log message for startup."""
+        return (
+            f"\n{'='*50}\n"
+            f"               FastMoE Configuration\n"
+            f"{'='*50}\n"
+            f"System:\n"
+            f"  • World Size       : {self.world_size}\n"
+            f"  • Log Level        : {self.log_level}\n"
+            f"  • Logs Dir         : {self.logs_dir}\n\n"
+            f"Model (Scale: {self.moe.scale.value}):\n"
+            f"  • Layers           : {self.moe.n_blocks}\n"
+            f"  • Hidden Dim       : {self.moe.hidden_dim}\n"
+            f"  • Attention Heads  : {self.moe.num_heads}\n"
+            f"  • Sequence Length  : {self.moe.seqlen}\n\n"
+            f"MoE & Training:\n"
+            f"  • Experts per GPU  : {self.moe.num_experts_per_gpu}\n"
+            f"  • Global Batch     : {self.moe.batch_size}\n"
+            f"  • Micro Batches    : {self.moe.micro_batches}\n"
+            f"  • Top-K            : {self.moe.top_k}\n"
+            f"  • Comm. Scaling    : {self.moe.comm_scaling_factor}x (Simulation)\n"
+            f"{'='*50}"
+        )
+
     def __repr__(self) -> str:
         """Produces a structured, readable log message for startup."""
         return (
