@@ -36,7 +36,12 @@ def worker(rank: int, world_size: int):
 
     model = TinyModel(cfg, dist.group.WORLD).cuda()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
-    data = torch.randn(cfg.moe.batch_size, cfg.moe.seqlen, cfg.moe.hidden_dim).cuda()
+    data = torch.randn(
+        cfg.moe.batch_size,
+        cfg.moe.seqlen,
+        cfg.moe.hidden_dim,
+        requires_grad=True,
+    ).cuda()
 
     def trace_handler(p):
         dist.barrier()
