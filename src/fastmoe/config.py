@@ -33,7 +33,7 @@ class MoESetup(BaseSettings):
     warmup_steps: int = 5
     active_steps: int = 3
 
-    comm_scaling_factor: int = 20
+    comm_scaling_factor: int = 1
 
 
 class Config(BaseSettings):
@@ -50,9 +50,9 @@ class Config(BaseSettings):
     def __str__(self) -> str:
         """Produces a structured, readable log message for startup."""
         return (
-            f"\n{'='*50}\n"
+            f"\n{'=' * 50}\n"
             f"               FastMoE Configuration\n"
-            f"{'='*50}\n"
+            f"{'=' * 50}\n"
             f"System:\n"
             f"  • World Size       : {self.world_size}\n"
             f"  • Log Level        : {self.log_level}\n"
@@ -68,15 +68,15 @@ class Config(BaseSettings):
             f"  • Micro Batches    : {self.moe.micro_batches}\n"
             f"  • Top-K            : {self.moe.top_k}\n"
             f"  • Comm. Scaling    : {self.moe.comm_scaling_factor}x (Simulation)\n"
-            f"{'='*50}"
+            f"{'=' * 50}"
         )
 
     def __repr__(self) -> str:
         """Produces a structured, readable log message for startup."""
         return (
-            f"\n{'='*50}\n"
+            f"\n{'=' * 50}\n"
             f"               FastMoE Configuration\n"
-            f"{'='*50}\n"
+            f"{'=' * 50}\n"
             f"System:\n"
             f"  • World Size       : {self.world_size}\n"
             f"  • Log Level        : {self.log_level}\n"
@@ -92,7 +92,7 @@ class Config(BaseSettings):
             f"  • Micro Batches    : {self.moe.micro_batches}\n"
             f"  • Top-K            : {self.moe.top_k}\n"
             f"  • Comm. Scaling    : {self.moe.comm_scaling_factor}x (Simulation)\n"
-            f"{'='*50}"
+            f"{'=' * 50}"
         )
 
 
