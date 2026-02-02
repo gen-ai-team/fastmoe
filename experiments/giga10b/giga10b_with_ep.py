@@ -1,3 +1,4 @@
+import math
 import os
 from enum import Enum
 
@@ -116,33 +117,28 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
 def apply_rotary_pos_emb_interleave_varlen(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, unsqueeze_dim: int = 1
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # Robustly handle both 3D [Seq, Head, Dim] and 4D [Batch, Head, Seq, Dim]
-    # We ignore unsqueeze_dim argument here and infer shapes directly for safety
+    # Robust Handle: [B, H, S, D] or [B, 1, S, D]
 
-    if q.dim() == 3:  # (total_tokens, heads, dim)
-        # Flattened/Packed case
-        cos = cos.unsqueeze(1)  # [Seq, 1, Dim]
-        sin = sin.unsqueeze(1)
+    # Cos/Sin come in as [Seq, Dim]. Need to reshape for broadcasting.
+    # Target shape: [1, 1, Seq, Dim] assuming batch first
+    cos = cos.unsqueeze(0).unsqueeze(0)
+    sin = sin.unsqueeze(0).unsqueeze(0)
 
-        n, h, d = q.shape
-        q_reshaped = q.view(n, h, d // 2, 2).transpose(-1, -2).reshape(n, h, d)
-        n, h, d = k.shape
-        k_reshaped = k.view(n, h, d // 2, 2).transpose(-1, -2).reshape(n, h, d)
+    # Helper to process Q or K
+    def apply_rot(x):
+        # x is [B, H, S, D]
+        b, h, s, d = x.shape
+        # Interleave Logic: reshape [..., d] -> [..., d/2, 2] -> transpose -> flatten
+        x_reshaped = x.view(b, h, s, d // 2, 2).transpose(-1, -2).reshape(b, h, s, d)
+        return (x_reshaped * cos) + (rotate_half(x_reshaped) * sin)
 
-    elif q.dim() == 4:  # (batch, heads, seq_len, dim)
-        # Standard case
-        cos = cos.unsqueeze(0).unsqueeze(0)  # [1, 1, Seq, Dim]
-        sin = sin.unsqueeze(0).unsqueeze(0)
+    return apply_rot(q), apply_rot(k)
 
-        b, h, s, d = q.shape
-        q_reshaped = q.view(b, h, s, d // 2, 2).transpose(-1, -2).reshape(b, h, s, d)
-        k_reshaped = k.view(b, h, s, d // 2, 2).transpose(-1, -2).reshape(b, h, s, d)
-    else:
-        raise ValueError(f"Unexpected q dim: {q.dim()}")
 
-    q_embed = (q_reshaped * cos) + (rotate_half(q_reshaped) * sin)
-    k_embed = (k_reshaped * cos) + (rotate_half(k_reshaped) * sin)
-    return q_embed, k_embed
+def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
+    if scale <= 1:
+        return 1.0
+    return 0.1 * mscale * math.log(scale) + 1.0
 
 
 class MLP(nn.Module):
@@ -280,11 +276,11 @@ class Attention(nn.Module):
     ) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
 
-        # 1. Projections
+        # 1. Projections & Reshape to [B, H, S, D]
         q_states = self.q_proj(hidden_states)
         q_states = q_states.view(batch_size, seq_len, self.num_heads, self.qk_head_dim).transpose(
             1, 2
-        )  # [B, H, S, D]
+        )
 
         compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
         k_pass, k_rot = torch.split(
@@ -301,32 +297,26 @@ class Attention(nn.Module):
         k_pass = k_pass.transpose(1, 2)
         value_states = value_states.transpose(1, 2)
 
-        # 2. RoPE Logic (Simplified)
+        # 2. RoPE Logic
         q_pass, q_rot = torch.split(
             q_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
         )
 
-        # Reshape rot parts back to [B, H, S, D] logic for the rot function if needed,
-        # but our q_states is already [B, H, S, D].
-        # We need k_rot to be [B, 1, S, D] for broadcasting if heads differ, or just expand it.
-        k_rot = k_rot.view(batch_size, seq_len, 1, self.qk_rope_head_dim).transpose(
-            1, 2
-        )  # [B, 1, S, D]
+        # [FIX] Ensure k_rot is [B, 1, S, D] for single-head RoPE
+        k_rot = k_rot.view(batch_size, seq_len, 1, self.qk_rope_head_dim).transpose(1, 2)
 
-        cos, sin = position_embeddings  # Expecting [Seq, Dim]
+        cos, sin = position_embeddings
 
         # Apply RoPE
-        # q_rot: [B, H, S, D], k_rot: [B, 1, S, D]
         q_rot, k_rot = apply_rotary_pos_emb_interleave_varlen(q_rot, k_rot, cos, sin)
 
         # Broadcast k_rot to number of kv heads
         k_rot = k_rot.expand(-1, self.num_key_value_heads, -1, -1)
 
-        query_states = torch.cat((q_pass, q_rot), dim=-1)  # [B, H, S, D]
-        key_states = torch.cat((k_pass, k_rot), dim=-1)  # [B, H_kv, S, D]
+        query_states = torch.cat((q_pass, q_rot), dim=-1)
+        key_states = torch.cat((k_pass, k_rot), dim=-1)
 
         # 3. SDPA
-        # Handle GQA (Repeat KV heads if needed)
         if self.num_heads != self.num_key_value_heads:
             key_states = key_states.repeat_interleave(
                 self.num_heads // self.num_key_value_heads, dim=1
