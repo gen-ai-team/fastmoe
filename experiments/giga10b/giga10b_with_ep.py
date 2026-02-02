@@ -1043,7 +1043,7 @@ def benchmark_worker(rank, world_size):
         num_hidden_layers=4,
         n_routed_experts=8,
         world_size=world_size,
-        micro_batches=4,
+        micro_batches=2,
         comm_scaling_factor=1.0,
         vocab_size=32000,
     )
@@ -1079,3 +1079,113 @@ def benchmark_worker(rank, world_size):
 def run_benchmark():
     logger.info("Starting Benchmark...")
     mp.start_processes(benchmark_worker, args=(2,), nprocs=2, join=True, start_method="fork")
+
+
+# 1. Generic Benchmark Worker
+def benchmark_worker_sbs(rank, world_size, model_cls, run_name):
+    # Setup Process Group
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = "12378"  # Different port to be safe
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
+
+    # 2. Production-Lite Config (Stresses Communication)
+    # We use a larger hidden size/batch to make compute/comm significant
+    cfg = Giga10BConfig(
+        vocab_size=32000,
+        hidden_size=4096,
+        intermediate_size=11008,
+        moe_intermediate_size=14336,
+        num_hidden_layers=2,
+        n_routed_experts=8,
+        world_size=world_size,
+        micro_batches=4,
+        comm_scaling_factor=1.0,
+        num_attention_heads=32,
+        num_key_value_heads=8,  # GQA
+    )
+
+    # 3. Model Init
+    model = model_cls(cfg, dist.group.WORLD).cuda()
+    model.train()  # Ensure backward graph is built
+
+    # 4. Inputs
+    B, S = 8, 512  # Heavier batch for throughput test
+    input_ids = torch.randint(0, cfg.vocab_size, (B, S)).cuda()
+    head_dim = cfg.qk_rope_head_dim
+    cos = torch.randn(S, head_dim).cuda()
+    sin = torch.randn(S, head_dim).cuda()
+
+    # 5. Warmup (Compile Kernels / Allocator)
+    if rank == 0:
+        logger.info(f"[{run_name}] Warming up...")
+    for _ in range(3):
+        y = model(input_ids, None, None, (cos, sin))
+        y.mean().backward()
+        for param in model.parameters():
+            param.grad = None
+    torch.cuda.synchronize()
+
+    # 6. Benchmark Loop
+    steps = 10
+    if rank == 0:
+        logger.info(f"[{run_name}] Running {steps} steps...")
+
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+
+    start_event.record()
+    for _ in range(steps):
+        y = model(input_ids, None, None, (cos, sin))
+        y.mean().backward()
+        # Mock optimizer step (zero grad)
+        for param in model.parameters():
+            param.grad = None
+
+    end_event.record()
+    torch.cuda.synchronize()
+
+    # 7. Metrics
+    elapsed_sec = start_event.elapsed_time(end_event) / 1000.0
+    total_tokens = steps * B * S
+    tps = total_tokens / elapsed_sec
+
+    if rank == 0:
+        logger.info(f"[{run_name}] ⏱️  Time: {elapsed_sec:.2f}s")
+        logger.info(f"[{run_name}] ⚡ Throughput: {tps:.2f} tokens/sec")
+
+    # Clean Exit
+    dist.destroy_process_group()
+
+
+# 2. Orchestrator
+def run_comparative_benchmark():
+    world_size = 2
+
+    print("=" * 60)
+    print("🚀 STARTING FAST_MOE (PIPELINED) BENCHMARK")
+    print("=" * 60)
+
+    # Run FastMoE in isolation
+    mp.start_processes(
+        benchmark_worker_sbs,
+        args=(world_size, FastMoEGigaModel, "FastMoE"),
+        nprocs=world_size,
+        join=True,
+        start_method="fork",
+    )
+
+    # Wait a moment for OS to reclaim GPU memory fully
+    time.sleep(2)
+    print("\n" + "=" * 60)
+    print("🐌 STARTING REFERENCE (SEQUENTIAL) BENCHMARK")
+    print("=" * 60)
+
+    # Run Reference in isolation
+    mp.start_processes(
+        benchmark_worker_sbs,
+        args=(world_size, ReferenceGigaModel, "Reference"),
+        nprocs=world_size,
+        join=True,
+        start_method="fork",
+    )
