@@ -1207,6 +1207,7 @@ class ReferenceGigaModel(nn.Module):
         return self.norm(hidden_states)
 
 
+# [CELL 7] Runner
 def check_tensors(rank, name, t1, t2):
     if torch.allclose(t1, t2, atol=1e-3, rtol=1e-3):
         return True
@@ -1217,9 +1218,7 @@ def check_tensors(rank, name, t1, t2):
 def sync_weights(model1, model2):
     with torch.no_grad():
         for (_n1, p1), (_, p2) in zip(
-            model1.named_parameters(),
-            model2.named_parameters(),
-            strict=False,
+            model1.named_parameters(), model2.named_parameters(), strict=False
         ):
             p2.data.copy_(p1.data)
 
@@ -1242,7 +1241,7 @@ def worker(rank, world_size):
         micro_batches=4,
         comm_scaling_factor=1.0,
         num_attention_heads=8,
-        num_key_value_heads=4,  # GQA
+        num_key_value_heads=4,
         qk_head_dim=64,
         v_head_dim=64,
         qk_rope_head_dim=32,
@@ -1258,19 +1257,15 @@ def worker(rank, world_size):
     B, S = 4, 32
     input_ids = torch.randint(0, cfg.vocab_size, (B, S)).cuda()
 
-    # RoPE Embeddings
+    # [FIX] RoPE embeddings must match the full head dim (32), not half (16)
     head_dim = cfg.qk_rope_head_dim
-    cos = torch.randn(S, head_dim // 2).cuda()
-    sin = torch.randn(S, head_dim // 2).cuda()
-
-    # Ignored args for SDPA version, but needed to match signature if you kept it
-    # We updated forward signature in DecoderLayer, so we just pass pos_emb
+    cos = torch.randn(S, head_dim).cuda()
+    sin = torch.randn(S, head_dim).cuda()
 
     dist.barrier()
     if rank == 0:
         logger.info(">>> Forward")
 
-    # Note: Updated signature calls
     y_fast = fast_model(input_ids, None, None, (cos, sin))
     y_ref = ref_model(input_ids, None, None, (cos, sin))
 
@@ -1300,7 +1295,3 @@ def worker(rank, world_size):
 
 def run_experiment():
     mp.start_processes(worker, args=(2,), nprocs=2, join=True, start_method="fork")
-
-
-if __name__ == "__main__":
-    run_experiment()
