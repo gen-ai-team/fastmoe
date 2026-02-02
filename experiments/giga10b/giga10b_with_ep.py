@@ -391,9 +391,7 @@ class FastMoERouterAdapter(nn.Module):
         capacity = int((num_tokens / self.num_experts) * self.capacity_factor)
         capacity = max(capacity, 4)
 
-        expert_mask = torch.nn.functional.one_hot(topk_indices, num_classes=self.num_experts).to(
-            torch.int32
-        )
+        expert_mask = F.one_hot(topk_indices, num_classes=self.num_experts).to(torch.int32)
         token_priority = torch.cumsum(expert_mask, dim=0) * expert_mask
         valid_mask = (token_priority > 0) & (token_priority <= capacity)
 
@@ -438,7 +436,6 @@ class MoEOverlapFunction(Function):
         fwd_ctx = [{} for _ in range(block.cfg.moe.micro_batches)]
         outputs = [None] * block.cfg.moe.micro_batches
 
-        # Events
         ev_pre = [torch.cuda.Event() for _ in range(block.cfg.moe.micro_batches)]
         ev_disp = [torch.cuda.Event() for _ in range(block.cfg.moe.micro_batches)]
         ev_exp = [torch.cuda.Event() for _ in range(block.cfg.moe.micro_batches)]
@@ -703,21 +700,27 @@ class PipelineMoEBlock(nn.Module):
                 valid_mask = gather_index != -1
                 d_x.index_add_(0, gather_index[valid_mask], d_permuted[valid_mask])
 
-                grads = torch.autograd.grad(permuted_weights_graph, x_in, d_permuted_weights)
+                # [FIXED] allow_unused=True
+                grads = torch.autograd.grad(
+                    permuted_weights_graph, x_in, d_permuted_weights, allow_unused=True
+                )
+                d_x_router = grads[0] if grads[0] is not None else torch.zeros_like(x_in)
 
-                # [FIXED] Access Router Params via .brain
+                # Manual Accumulation into Router Parameters
                 d_router_params = torch.autograd.grad(
                     permuted_weights_graph,
                     self.router.brain.weight,
                     d_permuted_weights,
                     retain_graph=True,
+                    allow_unused=True,
                 )
-                if self.router.brain.weight.grad is None:
-                    self.router.brain.weight.grad = d_router_params[0]
-                else:
-                    self.router.brain.weight.grad += d_router_params[0]
+                if d_router_params[0] is not None:
+                    if self.router.brain.weight.grad is None:
+                        self.router.brain.weight.grad = d_router_params[0]
+                    else:
+                        self.router.brain.weight.grad += d_router_params[0]
 
-                dx_list[mb_idx] = d_x + grads[0]
+                dx_list[mb_idx] = d_x + d_x_router + grads[0] if grads[0] is not None else d_x
 
 
 class FastMoEDecoderLayer(nn.Module):
