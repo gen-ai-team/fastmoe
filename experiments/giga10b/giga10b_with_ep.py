@@ -1023,3 +1023,59 @@ def worker(rank, world_size):
 
 def run_experiment():
     mp.start_processes(worker, args=(2,), nprocs=2, join=True, start_method="fork")
+
+
+# [CELL 8] Performance Benchmark
+import time  # noqa
+
+
+def benchmark_worker(rank, world_size):
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = "12377"
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
+
+    # 1. Production Config (Larger)
+    cfg = Giga10BConfig(
+        hidden_size=4096,
+        intermediate_size=11008,
+        moe_intermediate_size=14336,
+        num_hidden_layers=4,
+        n_routed_experts=8,
+        world_size=world_size,
+        micro_batches=4,
+        comm_scaling_factor=1.0,
+        vocab_size=32000,
+    )
+
+    fast_model = FastMoEGigaModel(cfg, dist.group.WORLD).cuda()
+    # Warmup
+    B, S = 16, 128  # Reasonable batch for benchmarking
+    input_ids = torch.randint(0, cfg.vocab_size, (B, S)).cuda()
+    head_dim = cfg.qk_rope_head_dim
+    cos = torch.randn(S, head_dim).cuda()
+    sin = torch.randn(S, head_dim).cuda()
+
+    # Run FastMoE
+    for _ in range(5):
+        fast_model(input_ids, None, None, (cos, sin))
+    torch.cuda.synchronize()
+
+    start = time.time()
+    steps = 20
+    for _ in range(steps):
+        y = fast_model(input_ids, None, None, (cos, sin))
+        y.mean().backward()
+    torch.cuda.synchronize()
+    dt = time.time() - start
+
+    tokens_per_sec = (steps * B * S) / dt
+    if rank == 0:
+        logger.info(f"⚡ FastMoE Throughput: {tokens_per_sec:.2f} tokens/sec")
+
+    dist.destroy_process_group()
+
+
+def run_benchmark():
+    logger.info("Starting Benchmark...")
+    mp.start_processes(benchmark_worker, args=(2,), nprocs=2, join=True, start_method="fork")
