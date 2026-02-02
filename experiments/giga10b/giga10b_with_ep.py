@@ -275,33 +275,65 @@ class Attention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        max_seqlen: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        q_states = self.q_proj(hidden_states).view(-1, self.num_heads, self.qk_head_dim)
-        q_pass, q_rot = torch.split(
-            q_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
-        )
+        batch_size, seq_len, _ = hidden_states.shape
+
+        # 1. Projections
+        q_states = self.q_proj(hidden_states)
+        q_states = q_states.view(batch_size, seq_len, self.num_heads, self.qk_head_dim).transpose(
+            1, 2
+        )  # [B, H, S, D]
 
         compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
         k_pass, k_rot = torch.split(
             compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
         )
+
         k_pass = self.kv_b_proj(self.kv_a_layernorm(k_pass))
-        k_pass = k_pass.view(-1, self.num_key_value_heads, self.qk_nope_head_dim + self.v_head_dim)
+        k_pass = k_pass.view(
+            batch_size, seq_len, self.num_key_value_heads, self.qk_nope_head_dim + self.v_head_dim
+        )
         k_pass, value_states = torch.split(k_pass, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
 
-        cos, sin = position_embeddings
-        k_rot = k_rot.unsqueeze(1)
-        q_rot, k_rot = apply_rotary_pos_emb_interleave_varlen(
-            q_rot, k_rot, cos, sin, unsqueeze_dim=1
-        )
-        k_rot = k_rot.expand(*k_pass.shape[:-1], -1)
+        # Transpose K/V to [B, H, S, D]
+        k_pass = k_pass.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
 
-        query_states = torch.cat((q_pass, q_rot), dim=-1)
-        key_states = torch.cat((k_pass, k_rot), dim=-1)
+        # 2. RoPE Logic (Simplified)
+        q_pass, q_rot = torch.split(
+            q_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+        )
+
+        # Reshape rot parts back to [B, H, S, D] logic for the rot function if needed,
+        # but our q_states is already [B, H, S, D].
+        # We need k_rot to be [B, 1, S, D] for broadcasting if heads differ, or just expand it.
+        k_rot = k_rot.view(batch_size, seq_len, 1, self.qk_rope_head_dim).transpose(
+            1, 2
+        )  # [B, 1, S, D]
+
+        cos, sin = position_embeddings  # Expecting [Seq, Dim]
+
+        # Apply RoPE
+        # q_rot: [B, H, S, D], k_rot: [B, 1, S, D]
+        q_rot, k_rot = apply_rotary_pos_emb_interleave_varlen(q_rot, k_rot, cos, sin)
+
+        # Broadcast k_rot to number of kv heads
+        k_rot = k_rot.expand(-1, self.num_key_value_heads, -1, -1)
+
+        query_states = torch.cat((q_pass, q_rot), dim=-1)  # [B, H, S, D]
+        key_states = torch.cat((k_pass, k_rot), dim=-1)  # [B, H_kv, S, D]
+
+        # 3. SDPA
+        # Handle GQA (Repeat KV heads if needed)
+        if self.num_heads != self.num_key_value_heads:
+            key_states = key_states.repeat_interleave(
+                self.num_heads // self.num_key_value_heads, dim=1
+            )
+            value_states = value_states.repeat_interleave(
+                self.num_heads // self.num_key_value_heads, dim=1
+            )
 
         attn_output = F.scaled_dot_product_attention(
             query_states,
@@ -311,7 +343,9 @@ class Attention(nn.Module):
             dropout_p=0.0,
             is_causal=True,
         )
-        return self.o_proj(attn_output.reshape(attn_output.shape[0], -1).contiguous())
+
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+        return self.o_proj(attn_output)
 
 
 class Streams(Enum):
