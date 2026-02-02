@@ -116,23 +116,33 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
 def apply_rotary_pos_emb_interleave_varlen(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, unsqueeze_dim: int = 1
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    if q.dim() == 3:
+    # Robustly handle both 3D [Seq, Head, Dim] and 4D [Batch, Head, Seq, Dim]
+    # We ignore unsqueeze_dim argument here and infer shapes directly for safety
+
+    if q.dim() == 3:  # (total_tokens, heads, dim)
+        # Flattened/Packed case
+        cos = cos.unsqueeze(1)  # [Seq, 1, Dim]
+        sin = sin.unsqueeze(1)
+
         n, h, d = q.shape
-        q = q.view(n, h, d // 2, 2).transpose(-1, -2).reshape(n, h, d)
+        q_reshaped = q.view(n, h, d // 2, 2).transpose(-1, -2).reshape(n, h, d)
         n, h, d = k.shape
-        k = k.view(n, h, d // 2, 2).transpose(-1, -2).reshape(n, h, d)
-    else:
+        k_reshaped = k.view(n, h, d // 2, 2).transpose(-1, -2).reshape(n, h, d)
+
+    elif q.dim() == 4:  # (batch, heads, seq_len, dim)
+        # Standard case
+        cos = cos.unsqueeze(0).unsqueeze(0)  # [1, 1, Seq, Dim]
+        sin = sin.unsqueeze(0).unsqueeze(0)
+
         b, h, s, d = q.shape
-        q = q.view(b, h, s, d // 2, 2).transpose(-1, -2).reshape(b, h, s, d)
-        k = k.view(b, h, s, d // 2, 2).transpose(-1, -2).reshape(b, h, s, d)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+        q_reshaped = q.view(b, h, s, d // 2, 2).transpose(-1, -2).reshape(b, h, s, d)
+        k_reshaped = k.view(b, h, s, d // 2, 2).transpose(-1, -2).reshape(b, h, s, d)
+    else:
+        raise ValueError(f"Unexpected q dim: {q.dim()}")
+
+    q_embed = (q_reshaped * cos) + (rotate_half(q_reshaped) * sin)
+    k_embed = (k_reshaped * cos) + (rotate_half(k_reshaped) * sin)
     return q_embed, k_embed
-
-
-from flash_attn import flash_attn_varlen_func  # noqa
 
 
 class MLP(nn.Module):
@@ -293,17 +303,13 @@ class Attention(nn.Module):
         query_states = torch.cat((q_pass, q_rot), dim=-1)
         key_states = torch.cat((k_pass, k_rot), dim=-1)
 
-        attn_output = flash_attn_varlen_func(
+        attn_output = F.scaled_dot_product_attention(
             query_states,
             key_states,
             value_states,
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_k=cu_seqlens,
-            max_seqlen_q=max_seqlen,
-            max_seqlen_k=max_seqlen,
-            softmax_scale=self.scaling,
+            attn_mask=attention_mask,
             dropout_p=0.0,
-            causal=True,
+            is_causal=True,
         )
         return self.o_proj(attn_output.reshape(attn_output.shape[0], -1).contiguous())
 
