@@ -1044,7 +1044,7 @@ class FastMoEDecoderLayer(nn.Module):
     def forward(self, hidden_states, cu_seqlens, max_seqlen, position_embeddings):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, cu_seqlens, max_seqlen, position_embeddings)
+        hidden_states = self.self_attn(hidden_states, position_embeddings)
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -1176,7 +1176,7 @@ class ReferenceDecoderLayer(nn.Module):
         # Same forward as FastMoEDecoderLayer
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, cu_seqlens, max_seqlen, position_embeddings)
+        hidden_states = self.self_attn(hidden_states, position_embeddings)
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -1251,6 +1251,12 @@ def worker(rank, world_size):
         world_size=world_size,
         micro_batches=4,
         comm_scaling_factor=1.0,
+        num_attention_heads=8,
+        num_key_value_heads=4,  # GQA
+        qk_head_dim=64,
+        v_head_dim=64,
+        qk_rope_head_dim=32,
+        qk_nope_head_dim=32,
     )
 
     # 2. Models
@@ -1261,17 +1267,23 @@ def worker(rank, world_size):
     # 3. Inputs
     B, S = 4, 32
     input_ids = torch.randint(0, cfg.vocab_size, (B, S)).cuda()
+
+    # RoPE Embeddings
     head_dim = cfg.qk_rope_head_dim
     cos = torch.randn(S, head_dim // 2).cuda()
     sin = torch.randn(S, head_dim // 2).cuda()
-    cu_seqlens = torch.arange(0, (B + 1) * S, step=S, dtype=torch.int32).cuda()
+
+    # Ignored args for SDPA version, but needed to match signature if you kept it
+    # We updated forward signature in DecoderLayer, so we just pass pos_emb
 
     dist.barrier()
     if rank == 0:
         logger.info(">>> Forward")
 
-    y_fast = fast_model(input_ids, cu_seqlens, S, (cos, sin))
-    y_ref = ref_model(input_ids, cu_seqlens, S, (cos, sin))
+    # Note: Updated signature calls
+    y_fast = fast_model(input_ids, None, None, (cos, sin))
+    y_ref = ref_model(input_ids, None, None, (cos, sin))
+
     check_tensors(rank, "Output", y_fast, y_ref)
 
     if rank == 0:
