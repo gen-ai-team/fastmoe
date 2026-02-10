@@ -46,7 +46,7 @@ except ImportError:
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║  SECTION 1 — Config dataclasses (mirrors omni_model_moe_10b.yaml)      ║
+# ║  SECTION 1 — Configs                                                     ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 
@@ -431,20 +431,30 @@ class Attention(nn.Module):
 
     def forward(self, x, cu, max_s, pos_emb, mask=None):
         c = self.cfg
+
+        if isinstance(max_s, torch.Tensor):
+            max_s = int(max_s.item())
+
         q = self.q_proj(x).view(-1, c.num_attention_heads, c.qk_head_dim)
         qp, qr = q.split([c.qk_nope_head_dim, c.qk_rope_head_dim], dim=-1)
+
         ckv = self.kv_a_proj_with_mqa(x)
         kp, kr = ckv.split([c.kv_lora_rank, c.qk_rope_head_dim], dim=-1)
+
         kp = self.kv_b_proj(self.kv_a_layernorm(kp))
         kp = kp.view(-1, c.num_key_value_heads, c.qk_nope_head_dim + c.v_head_dim)
         kp, v = kp.split([c.qk_nope_head_dim, c.v_head_dim], dim=-1)
+
         cos, sin = pos_emb
         kr = kr.unsqueeze(1)
         qr, kr = apply_rotary_pos_emb_interleave_varlen(qr, kr, cos, sin, unsqueeze_dim=1)
         kr = kr.expand(*kp.shape[:-1], -1)
+
         qs = torch.cat((qp, qr), -1)
         ks = torch.cat((kp, kr), -1)
-        if HAS_FLASH:
+
+        use_flash = HAS_FLASH and qs.is_cuda and qs.dtype in (torch.float16, torch.bfloat16)
+        if use_flash:
             ao = flash_attn_varlen_func(
                 qs,
                 ks,
@@ -453,12 +463,13 @@ class Attention(nn.Module):
                 cu,
                 max_s,
                 max_s,
-                softmax_scale=self.scaling,
+                softmax_scale=float(self.scaling),
                 dropout_p=0.0,
                 causal=True,
             )
         else:
-            ao = _sdpa_varlen(qs, ks, v, cu, max_s, self.scaling)
+            ao = _sdpa_varlen(qs, ks, v, cu, max_s, scale=float(self.scaling), causal=True)
+
         return self.o_proj(ao.reshape(ao.shape[0], -1).contiguous())
 
 
@@ -574,13 +585,11 @@ class OmniModelMoE(nn.Module):
 
     def forward(self, input_ids, position_embeddings, position_ids, attention_mask=None):
         x = self.embed_tokens(input_ids)
-        cu = []
-        for i, p in enumerate(position_ids):
-            if p == 0:
-                cu.append(i)
-        cu.append(len(position_ids))
-        cu_t = torch.tensor(cu, device=x.device, dtype=torch.int32)
-        max_s = position_ids.max() + 1
+        starts = torch.nonzero(position_ids == 0, as_tuple=False).flatten()
+        cu_t = torch.empty(starts.numel() + 1, device=position_ids.device, dtype=torch.int32)
+        cu_t[:-1] = starts.to(torch.int32)
+        cu_t[-1] = position_ids.numel()
+        max_s = int(position_ids.max().item()) + 1
         for layer in self.layers:
             x = layer(x, cu_t, max_s, position_embeddings, attention_mask)
         return self.norm(x)
@@ -601,55 +610,57 @@ def make_ep_streams():
 
 
 def permute_for_ep(x_flat, topk_idx, topk_w, n_experts, capacity):
-    """Router output → EP dispatch layout.
-
-    Args:
-        x_flat:    [N, D]  flattened hidden states
-        topk_idx:  [N, K]  expert indices per token
-        topk_w:    [N, K]  gate weights per token
-        n_experts: total expert count
-        capacity:  max tokens per expert slot
-
-    Returns:
-        perm_inputs:  [n_experts * capacity, D]
-        perm_weights: [n_experts * capacity]
-        gather_index: [n_experts * capacity] (-1 = pad)
+    """
+    Router output → EP dispatch layout.
     """
     N, K = topk_idx.shape
-    _ = x_flat.shape[-1]
     dev = x_flat.device
+
+    topk_w = topk_w.to(dtype=x_flat.dtype)
+
     em = F.one_hot(topk_idx, n_experts).to(torch.int32)  # [N, K, E]
     pri = torch.cumsum(em, dim=0) * em  # [N, K, E]
     valid = (pri > 0) & (pri <= capacity)
 
     vf = valid.view(-1, n_experts)
     pf = pri.view(-1, n_experts)
+
     row = torch.arange(N * K, device=dev).unsqueeze(1).expand(-1, n_experts)
     orig = row // K
+
     er = torch.arange(n_experts, device=dev).unsqueeze(0)
-    dest = er * capacity + (pf - 1)
+    dest = er * capacity + (pf - 1)  # indices into [E*cap]
     act = vf.bool()
 
     gi = torch.full((n_experts * capacity,), -1, dtype=torch.long, device=dev)
     gi.scatter_(0, dest[act].flatten(), orig[act].flatten())
 
-    wf = topk_w.reshape(-1).unsqueeze(1).expand(-1, n_experts)
-    pw = torch.zeros(n_experts * capacity, dtype=x_flat.dtype, device=dev)
+    wf = topk_w.reshape(-1).unsqueeze(1).expand(-1, n_experts)  # now same dtype as x_flat
+    pw = torch.zeros(n_experts * capacity, dtype=topk_w.dtype, device=dev)
     pw.scatter_(0, dest[act].flatten(), wf[act].flatten())
 
     si = gi.clamp(min=0)
     pi = x_flat[si]
-    pi.masked_fill_((gi == -1).unsqueeze(1), 0.0)
+    pi.masked_fill_((gi == -1).unsqueeze(1), 0)
     return pi, pw, gi
 
 
 def unpermute_from_ep(moe_out, gi, pw, N, D):
-    """Scatter weighted expert outputs back to original token positions."""
-    w = moe_out * pw.unsqueeze(1)
-    out = torch.zeros(N, D, dtype=moe_out.dtype, device=moe_out.device)
+    """
+    Scatter weighted expert outputs back to original token positions.
+
+    """
+    out_dtype = moe_out.dtype
+    moe_f = moe_out.float()
+    pw_f = pw.float()
+
+    w = moe_f * pw_f.unsqueeze(1)
+    out = torch.zeros(N, D, dtype=torch.float32, device=moe_out.device)
+
     v = gi != -1
     out.index_add_(0, gi[v], w[v])
-    return out
+
+    return out.to(dtype=out_dtype)
 
 
 def build_mb_meta(pos_ids, pos_emb, seq_len, batch_size, n_mb):
