@@ -11,9 +11,9 @@ from fastmoe.models.router import TopKRouter
 
 
 # ==========================================
-# Modules (SelfAttention, Expert) - Unchanged
+# Modules (Attention, Expert)
 # ==========================================
-class SelfAttention(nn.Module):
+class Attention(nn.Module):
     """
     Standard Multi-Head Attention to simulate realistic compute workloads.
     """
@@ -134,8 +134,8 @@ class PipelineMoEBlock(nn.Module):
         cfg: Config,
         group: dist.ProcessGroup,
         block_name: str,
-        pre_op_module: SelfAttention | None,
-        post_op_module: SelfAttention | nn.Linear | None,
+        pre_op_module: Attention | None,
+        post_op_module: Attention | nn.Linear | None,
         streams: dict[Streams, torch.cuda.Stream],
     ) -> None:
         super().__init__()
@@ -610,7 +610,7 @@ class PipelineMoEBlock(nn.Module):
                         inputs=(x_in,)
                         + tuple(self.pre_ops.parameters())
                         + tuple(self.moe_norm.parameters())
-                        + tuple(self.router.gate.parameters()),  # [NEW] Add Router Params
+                        + tuple(self.router.gate.parameters()),
                         allow_unused=True,
                     )
 
@@ -671,7 +671,7 @@ class TinyModel(nn.Module):
             # Only the first block (i=0) needs to run its own Attention.
             # Subsequent blocks receive the output of Attn(i) which was computed in Block(i-1)'s Post-Op. # noqa
             if i == 0:
-                pre_module = SelfAttention(self.hidden_dim, cfg.moe.num_heads)
+                pre_module = Attention(self.hidden_dim, cfg.moe.num_heads)
             else:
                 pre_module = None  # Becomes nn.Identity inside the block
 
@@ -679,7 +679,7 @@ class TinyModel(nn.Module):
             # Blocks 0 to N-2 compute the *next* block's Attention.
             # The final block (N-1) computes the final Linear layer (or Identity if no head).
             if i < cfg.moe.n_blocks - 1:
-                post_module = SelfAttention(self.hidden_dim, cfg.moe.num_heads)
+                post_module = Attention(self.hidden_dim, cfg.moe.num_heads)
             else:
                 # Final block post-op: Project to output or next stage
                 post_module = nn.Linear(self.hidden_dim, self.hidden_dim)
