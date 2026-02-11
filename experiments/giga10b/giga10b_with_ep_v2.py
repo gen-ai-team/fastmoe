@@ -1299,40 +1299,45 @@ class PipelineMoELayer(nn.Module):
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 
-class EPOmniModelMoE(nn.Module):
-    """Expert-Parallel OmniModelMoE.
+class EPCausalLM(nn.Module):
+    """Expert-Parallel CausalLM.
 
     Layer 0 (dense MLP) runs without EP.
     Layers 1-25 (MoE) each run through the 5-stage EP pipeline.
-    Embedding and final RMSNorm are replicated.
+    Embedding, final RMSNorm, and lm_head are replicated.
     """
 
-    def __init__(self, ref: OmniModelMoE, rank, world_size, group, n_micro_batches=4):
+    def __init__(self, ref: CausalLM, rank, world_size, group, n_micro_batches=4):
         super().__init__()
-        self.cfg = ref.cfg
-        self.H = ref.cfg.embeddings.hidden_size
+        self.cfg = ref.model.cfg
+        self.H = ref.model.cfg.embeddings.hidden_size
         self.n_mb = n_micro_batches
 
-        # Replicated
-        self.embed_tokens = ref.embed_tokens
-        self.dense_layer = ref.layers[0]  # layer 0 = dense MLP
-        self.norm = ref.norm
+        backbone = ref.model
 
-        # Shared streams across all EP layers (two streams: COMPUTE + COMM)
+        # Replicated
+        self.embed_tokens = backbone.embed_tokens
+        self.dense_layer = backbone.layers[0]  # layer 0 = dense MLP
+        self.norm = backbone.norm
+        self.lm_head = ref.lm_head  # replicated lm_head
+
+        # Shared streams
         streams = make_ep_streams()
 
-        # Wrap each MoE layer in the 5-stage pipeline
+        # Wrap MoE layers 1-25 in 5-stage pipeline
         self.ep_layers = nn.ModuleList()
-        for i in range(1, ref.cfg.num_hidden_layers):
+        for i in range(1, backbone.cfg.num_hidden_layers):
             self.ep_layers.append(
-                PipelineMoELayer(ref.layers[i], rank, world_size, group, streams, n_micro_batches)
+                PipelineMoELayer(
+                    backbone.layers[i], rank, world_size, group, streams, n_micro_batches
+                )
             )
 
     def forward(
         self,
         input_ids,
-        position_embeddings,
         position_ids,
+        position_embeddings,
         attention_mask=None,
         batch_size=None,
         seq_len=None,
@@ -1348,22 +1353,23 @@ class EPOmniModelMoE(nn.Module):
         cu_t = torch.tensor(cu, device=x.device, dtype=torch.int32)
         max_s = position_ids.max() + 1
 
-        # ---- Layer 0: dense MLP, no EP ----
+        # Layer 0: dense MLP, no EP
         x = self.dense_layer(x, cu_t, max_s, position_embeddings, attention_mask)
 
-        # ---- Layers 1-25: MoE with 5-stage EP pipeline ----
+        # Layers 1-25: MoE with 5-stage EP pipeline
         if batch_size is None:
             batch_size = len(cu) - 1
         if seq_len is None:
             seq_len = int(max_s.item()) if isinstance(max_s, torch.Tensor) else int(max_s)
 
         metas = build_mb_meta(position_ids, position_embeddings, seq_len, batch_size, self.n_mb)
-
         for ep_l in self.ep_layers:
             ep_l._metas = metas
             x = ep_l(x)
 
-        return self.norm(x)
+        hidden_states = self.norm(x)
+        logits = self.lm_head(hidden_states)
+        return {"logits": logits, "hidden_states": hidden_states, "loss": None}
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -1393,7 +1399,7 @@ def _worker(rank, world_size):
     ep_base.eval()
 
     group = dist.group.WORLD
-    ep = EPOmniModelMoE(ep_base, rank, world_size, group, n_micro_batches=4)
+    ep = EPCausalLM(ep_base, rank, world_size, group, n_micro_batches=2).eval()
     ep.eval()
 
     # ---- RoPE ----
