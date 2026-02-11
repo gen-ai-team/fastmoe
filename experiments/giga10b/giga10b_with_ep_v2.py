@@ -22,28 +22,19 @@ import time
 import typing
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
-import loguru
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.nn.functional as F
 import yaml
+from flash_attn import flash_attn_varlen_func
 from omegaconf import OmegaConf
 from pydantic import BaseModel, ConfigDict
 from torch.autograd import Function
 from torch.profiler import ProfilerActivity, profile, record_function
-
-try:
-    from flash_attn import flash_attn_varlen_func
-
-    HAS_FLASH = True
-except ImportError:
-    HAS_FLASH = False
-    loguru.logger.info("flash_attn not available — using PyTorch SDPA fallback (slower)")
-
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║  SECTION 1 — Configs                                                     ║
@@ -305,294 +296,618 @@ def build_config() -> OmniModelMoEConfig:
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, cfg: RMSNormConfig):
+    """Universal RMSNorm implementation."""
+
+    def __init__(self, config: RMSNormConfig) -> None:
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(cfg.hidden_size))
-        self.eps = cfg.eps
+        self.weight = nn.Parameter(torch.ones(config.hidden_size))
+        self.variance_epsilon = config.eps
 
-    def forward(self, x):
-        dt = x.dtype
-        x = x.float()
-        return self.weight.to(dt) * (
-            x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        ).to(dt)
-
-
-def yarn_get_mscale(s=1.0, m=1.0):
-    return 1.0 if s <= 1 else 0.1 * m * math.log(s) + 1.0
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight.to(input_dtype) * hidden_states.to(input_dtype)
 
 
-def rotate_half(x):
-    return torch.cat((-x[..., x.shape[-1] // 2 :], x[..., : x.shape[-1] // 2]), -1)
+class RotaryEmbedding(nn.Module):
+    """Универсальный класс, который определяет тип ROPE параметров на основе
+    типа конфига."""
+
+    def __init__(
+        self,
+        config: MoERotaryEmbeddingsConfig,
+        device: "torch.device",
+    ) -> None:
+        super().__init__()
+
+        self.device = device
+        self.max_position_embeddings = config.max_position_embeddings
+        self.base = config.rope_theta
+
+        if isinstance(config, MoERotaryEmbeddingsConfig):
+            # OmniModel MoE использует YaRN
+
+            self.dim = config.qk_rope_head_dim
+            inv_freq, self.attention_scaling = self.compute_yarn_parameters(config)
+
+            raise NotImplementedError
+
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def forward(
+        self, data_type: torch.dtype, position_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # position_ids: [total_tokens] -> [total_tokens, 1]
+        pos = position_ids.float().unsqueeze(-1)
+
+        # inv_freq: [half_dim] -> [1, half_dim]
+        inv_freq = self.inv_freq.float().unsqueeze(0)
+
+        # Вычисляем углы
+        angles = pos * inv_freq  # [total_tokens, half_dim]
+
+        # Concatenate для получения Half-Split формата [x1, x2... y1, y2...]
+        # Это то, что ожидает функция apply_rotary_pos_emb_interleave_varlen
+        emb = torch.cat([angles, angles], dim=-1)
+
+        # Применяем scaling (важно для YaRN, безвредно для Default т.к. там 1.0)
+        cos = torch.cos(emb) * self.attention_scaling
+        sin = torch.sin(emb) * self.attention_scaling
+
+        return cos.to(dtype=data_type), sin.to(dtype=data_type)
+
+    def compute_yarn_parameters(
+        self,
+        config: MoERotaryEmbeddingsConfig,
+    ) -> tuple["torch.Tensor", float]:
+        """Computes the inverse frequencies with NTK scaling.
+
+        Please refer to the [original paper](
+        https://huggingface.co/papers/2309.00071)
+        """
+
+        base = config.rope_theta
+        head_dim = config.qk_rope_head_dim
+        dim = head_dim
+        factor = cast(float, config.rope_scaling.factor)
+        attention_factor = None
+        mscale = cast(float, config.rope_scaling.mscale)
+        mscale_all_dim = cast(float, config.rope_scaling.mscale_all_dim)
+        original_max_position_embeddings = (
+            cast(int, config.rope_scaling.original_max_position_embeddings)
+            or config.max_position_embeddings  # noqa
+        )
+
+        def get_mscale(scale: float, mscale: float = 1) -> float:
+            if scale <= 1:
+                return 1.0
+            return 0.1 * mscale * math.log(scale) + 1.0
+
+        # Sets the attention factor as suggested in the paper
+        if attention_factor is None:
+            if mscale and mscale_all_dim:
+                attention_factor = float(
+                    get_mscale(factor, mscale) / get_mscale(factor, mscale_all_dim)
+                )
+            else:
+                attention_factor = get_mscale(factor)
+
+        # Optional config options
+        # beta_fast/beta_slow: as suggested in the paper, default to 32 and 1 respectively
+        beta_fast = cast(float, config.rope_scaling.beta_fast) or 32
+        beta_slow = cast(float, config.rope_scaling.beta_slow) or 1
+
+        # Compute the inverse frequencies
+        def find_correction_dim(
+            num_rotations: float, dim: int, base: float, max_position_embeddings: int
+        ) -> float:
+            """Inverse dimension formula to find the dimension based on the
+            number of rotations."""
+            return (dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))) / (
+                2 * math.log(base)
+            )
+
+        def find_correction_range(
+            low_rot: float,
+            high_rot: float,
+            dim: int,
+            base: float,
+            max_position_embeddings: int,
+            truncate: bool,
+        ) -> tuple[int | float, int | float]:
+            """Find dimension range bounds based on rotations."""
+            low = find_correction_dim(low_rot, dim, base, max_position_embeddings)
+            high = find_correction_dim(high_rot, dim, base, max_position_embeddings)
+            if truncate:
+                low = math.floor(low)
+                high = math.ceil(high)
+            return max(low, 0), min(high, dim - 1)
+
+        def linear_ramp_factor(min: float, max: float, dim: int) -> torch.Tensor:
+            if min == max:
+                max += 0.001  # Prevent singularity
+
+            linear_func = (torch.arange(dim, dtype=torch.float32) - min) / (max - min)
+            ramp_func = torch.clamp(linear_func, 0, 1)
+            return ramp_func
+
+        pos_freqs = base ** (
+            torch.arange(0, dim, 2).to(device=self.device, dtype=torch.float) / dim
+        )
+        inv_freq_extrapolation = 1.0 / pos_freqs
+        inv_freq_interpolation = 1.0 / (factor * pos_freqs)
+
+        truncate = cast(bool, config.rope_scaling.truncate)
+        low, high = find_correction_range(
+            beta_fast, beta_slow, dim, base, original_max_position_embeddings, truncate
+        )
+
+        # Get n-dimensional rotational scaling corrected for extrapolation
+        inv_freq_extrapolation_factor = 1 - linear_ramp_factor(low, high, dim // 2).to(
+            device=self.device, dtype=torch.float
+        )
+        inv_freq = (
+            inv_freq_interpolation * (1 - inv_freq_extrapolation_factor)
+            + inv_freq_extrapolation * inv_freq_extrapolation_factor
+        )
+        return inv_freq, attention_factor
 
 
-def apply_rotary_pos_emb_interleave_varlen(q, k, cos, sin, unsqueeze_dim=1):
+def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
+    if scale <= 1:
+        return 1.0
+    return 0.1 * mscale * math.log(scale) + 1.0
+
+
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_pos_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    unsqueeze_dim: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Applies Rotary Position Embedding to the query and key tensors."""
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
-    if q.dim() == 3:
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+def apply_rotary_pos_emb_interleave_varlen(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    unsqueeze_dim: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Interleave версия с varlen."""
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+
+    if q.dim() == 3:  # (total_tokens, heads, dim)
         n, h, d = q.shape
         q = q.view(n, h, d // 2, 2).transpose(-1, -2).reshape(n, h, d)
         n, h, d = k.shape
         k = k.view(n, h, d // 2, 2).transpose(-1, -2).reshape(n, h, d)
-    else:
+    else:  # (batch, heads, seq_len, dim)
         b, h, s, d = q.shape
         q = q.view(b, h, s, d // 2, 2).transpose(-1, -2).reshape(b, h, s, d)
         k = k.view(b, h, s, d // 2, 2).transpose(-1, -2).reshape(b, h, s, d)
-    return (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
 
-
-class RotaryEmbedding(nn.Module):
-    def __init__(self, cfg: MoERotaryEmbeddingsConfig, device):
-        super().__init__()
-        self.device = device
-        self.dim = cfg.qk_rope_head_dim
-        inv, self.attn_scale = self._yarn(cfg)
-        self.register_buffer("inv_freq", inv, persistent=False)
-
-    def forward(self, dt, pos_ids):
-        ang = pos_ids.float().unsqueeze(-1) * self.inv_freq.float().unsqueeze(0)
-        emb = torch.cat([ang, ang], dim=-1)
-        c = torch.cos(emb) * self.attn_scale
-        s = torch.sin(emb) * self.attn_scale
-        return c.to(dtype=dt), s.to(dtype=dt)
-
-    def _yarn(self, cfg):
-        dim = cfg.qk_rope_head_dim
-        base = cfg.rope_theta
-        fac = cfg.rope_scaling.factor
-        ms = cfg.rope_scaling.mscale
-        mad = cfg.rope_scaling.mscale_all_dim
-        om = cfg.rope_scaling.original_max_position_embeddings or cfg.max_position_embeddings
-        gm = lambda s, m=1: 1.0 if s <= 1 else 0.1 * m * math.log(s) + 1.0  # noqa: E731
-        af = float(gm(fac, ms) / gm(fac, mad)) if ms and mad else gm(fac)
-        bf = cfg.rope_scaling.beta_fast or 32
-        bs = cfg.rope_scaling.beta_slow or 1
-        fd = lambda nr, d, b, mx: (d * math.log(mx / (nr * 2 * math.pi))) / (2 * math.log(b))  # noqa: E731
-
-        def fr(lr, hr, d, b, mx, tr):
-            lo = fd(lr, d, b, mx)
-            hi = fd(hr, d, b, mx)
-            if tr:
-                lo = math.floor(lo)
-                hi = math.ceil(hi)
-            return max(lo, 0), min(hi, d - 1)
-
-        def ramp(mn, mx, d):
-            if mn == mx:
-                mx += 0.001
-            return torch.clamp((torch.arange(d, dtype=torch.float32) - mn) / (mx - mn), 0, 1)
-
-        pf = base ** (torch.arange(0, dim, 2, device=self.device, dtype=torch.float) / dim)
-        ie = 1.0 / pf
-        ii = 1.0 / (fac * pf)
-        lo, hi = fr(bf, bs, dim, base, om, cfg.rope_scaling.truncate)
-        ef = 1 - ramp(lo, hi, dim // 2).to(self.device, dtype=torch.float)
-        return ii * (1 - ef) + ie * ef, af
-
-
-def _sdpa_varlen(q, k, v, cu, max_s, scale, causal=True):
-    """SDPA fallback for varlen when flash_attn is unavailable."""
-    B = cu.shape[0] - 1
-    outs = []
-    for i in range(B):
-        s, e = cu[i].item(), cu[i + 1].item()
-        qi = q[s:e].transpose(0, 1).unsqueeze(0)
-        ki = k[s:e].transpose(0, 1).unsqueeze(0)
-        vi = v[s:e].transpose(0, 1).unsqueeze(0)
-        o = F.scaled_dot_product_attention(qi, ki, vi, is_causal=causal, scale=scale)
-        outs.append(o.squeeze(0).transpose(0, 1))
-    return torch.cat(outs, dim=0)
-
-
-class Attention(nn.Module):
-    def __init__(self, cfg: MoEAttentionConfig):
-        super().__init__()
-        self.cfg = cfg
-        c = cfg
-        self.q_proj = nn.Linear(
-            c.hidden_size, c.num_attention_heads * c.qk_head_dim, bias=c.attention_bias
-        )
-        self.kv_a_proj_with_mqa = nn.Linear(
-            c.hidden_size, c.kv_lora_rank + c.qk_rope_head_dim, bias=c.attention_bias
-        )
-        self.kv_a_layernorm = RMSNorm(c.rms_norm)
-        self.kv_b_proj = nn.Linear(
-            c.kv_lora_rank,
-            c.num_key_value_heads * (c.qk_nope_head_dim + c.v_head_dim),
-            bias=c.attention_bias,
-        )
-        self.o_proj = nn.Linear(
-            c.num_attention_heads * c.v_head_dim, c.hidden_size, bias=c.attention_bias
-        )
-        self.scaling = c.qk_head_dim**-0.5
-        if c.rope_scaling and c.rope_scaling.mscale_all_dim:
-            ms = yarn_get_mscale(c.rope_scaling.factor, c.rope_scaling.mscale_all_dim)
-            self.scaling *= ms * ms
-
-    def forward(self, x, cu, max_s, pos_emb, mask=None):
-        c = self.cfg
-
-        if isinstance(max_s, torch.Tensor):
-            max_s = int(max_s.item())
-
-        q = self.q_proj(x).view(-1, c.num_attention_heads, c.qk_head_dim)
-        qp, qr = q.split([c.qk_nope_head_dim, c.qk_rope_head_dim], dim=-1)
-
-        ckv = self.kv_a_proj_with_mqa(x)
-        kp, kr = ckv.split([c.kv_lora_rank, c.qk_rope_head_dim], dim=-1)
-
-        kp = self.kv_b_proj(self.kv_a_layernorm(kp))
-        kp = kp.view(-1, c.num_key_value_heads, c.qk_nope_head_dim + c.v_head_dim)
-        kp, v = kp.split([c.qk_nope_head_dim, c.v_head_dim], dim=-1)
-
-        cos, sin = pos_emb
-        kr = kr.unsqueeze(1)
-        qr, kr = apply_rotary_pos_emb_interleave_varlen(qr, kr, cos, sin, unsqueeze_dim=1)
-        kr = kr.expand(*kp.shape[:-1], -1)
-
-        qs = torch.cat((qp, qr), -1)
-        ks = torch.cat((kp, kr), -1)
-
-        use_flash = HAS_FLASH and qs.is_cuda and qs.dtype in (torch.float16, torch.bfloat16)
-        if use_flash:
-            ao = flash_attn_varlen_func(
-                qs,
-                ks,
-                v,
-                cu,
-                cu,
-                max_s,
-                max_s,
-                softmax_scale=float(self.scaling),
-                dropout_p=0.0,
-                causal=True,
-            )
-        else:
-            ao = _sdpa_varlen(qs, ks, v, cu, max_s, scale=float(self.scaling), causal=True)
-
-        return self.o_proj(ao.reshape(ao.shape[0], -1).contiguous())
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
 
 
 class MLP(nn.Module):
-    def __init__(self, cfg: MLPConfig):
-        super().__init__()
-        self.gate_proj = nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(cfg.intermediate_size, cfg.hidden_size, bias=False)
-        self.act = nn.SiLU()
+    """MLP с SwiGLU."""
 
-    def forward(self, x):
-        return self.down_proj(self.act(self.gate_proj(x)) * self.up_proj(x))
+    def __init__(self, config: MLPConfig) -> None:
+        """В experts: intermediate_size=self.moe_cfg.moe_intermediate_size В
+        shared_experts: intermediate_size=self.moe_cfg.moe_intermediate_size *
+        self.moe_cfg.n_shared_experts."""
+        super().__init__()
+        self.cfg = config
+
+        self.gate_proj = nn.Linear(self.cfg.hidden_size, self.cfg.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.cfg.hidden_size, self.cfg.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.cfg.intermediate_size, self.cfg.hidden_size, bias=False)
+        self.act_fn = nn.SiLU()
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        act = self.act_fn(self.gate_proj(hidden_states))
+        down_proj = self.down_proj(act * self.up_proj(hidden_states))
+        return down_proj
 
 
 class TopkRouter(nn.Module):
-    def __init__(self, cfg: MoEConfig):
+    def __init__(
+        self,
+        config: MoEConfig,
+    ) -> None:
         super().__init__()
-        self.cfg = cfg
-        self.weight = nn.Parameter(torch.empty(cfg.n_routed_experts, cfg.hidden_size))
-        self.register_buffer("e_score_correction_bias", torch.zeros(cfg.n_routed_experts))
+
+        self.cfg = config
+
+        self.weight = nn.Parameter(torch.empty((self.cfg.n_routed_experts, self.cfg.hidden_size)))
+        self.register_buffer("e_score_correction_bias", torch.zeros(self.cfg.n_routed_experts))
 
     @torch.no_grad()
-    def get_topk_indices(self, scores):
-        c = self.cfg
-        sc = scores.view(-1, c.n_routed_experts) + self.e_score_correction_bias.unsqueeze(0)
-        gs = sc.view(-1, c.n_group, c.n_routed_experts // c.n_group).topk(2, dim=-1)[0].sum(-1)
-        gi = torch.topk(gs, k=c.topk_group, dim=-1, sorted=False)[1]
-        gm = torch.zeros_like(gs)
-        gm.scatter_(1, gi, 1)
-        sm = (
-            gm.unsqueeze(-1)
-            .expand(-1, c.n_group, c.n_routed_experts // c.n_group)
-            .reshape(-1, c.n_routed_experts)
+    def get_topk_indices(self, scores: torch.Tensor) -> torch.Tensor:
+        scores_for_choice = scores.view(
+            -1, self.cfg.n_routed_experts
+        ) + self.e_score_correction_bias.unsqueeze(0)
+        group_scores = (
+            scores_for_choice.view(
+                -1, self.cfg.n_group, self.cfg.n_routed_experts // self.cfg.n_group
+            )
+            .topk(2, dim=-1)[0]
+            .sum(dim=-1)
         )
-        sc = sc.masked_fill(~sm.bool(), 0.0)
-        return torch.topk(sc, k=c.num_experts_per_tok, dim=-1, sorted=False)[1]
+        group_idx = torch.topk(group_scores, k=self.cfg.topk_group, dim=-1, sorted=False)[1]
+        group_mask = torch.zeros_like(group_scores)
+        group_mask.scatter_(1, group_idx, 1)
+        score_mask = (
+            group_mask.unsqueeze(-1)
+            .expand(-1, self.cfg.n_group, self.cfg.n_routed_experts // self.cfg.n_group)
+            .reshape(-1, self.cfg.n_routed_experts)
+        )
+        scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), 0.0)
+        topk_indices = torch.topk(
+            scores_for_choice, k=self.cfg.num_experts_per_tok, dim=-1, sorted=False
+        )[1]
+        return topk_indices
 
-    def forward(self, x):
-        c = self.cfg
-        x = x.view(-1, c.hidden_size)
-        logits = F.linear(x.float(), self.weight.float())
-        scores = logits.sigmoid()
-        idx = self.get_topk_indices(scores)
-        w = scores.gather(1, idx)
-        if c.norm_topk_prob:
-            w = w / (w.sum(-1, keepdim=True) + 1e-20)
-        return idx, w * c.routed_scaling_factor
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        hidden_states = hidden_states.view(-1, self.cfg.hidden_size)
+        router_logits = torch.nn.functional.linear(
+            hidden_states.type(torch.float32), self.weight.type(torch.float32)
+        )
+        scores = router_logits.sigmoid()
+        topk_indices = self.get_topk_indices(scores)
+        topk_weights = scores.gather(1, topk_indices)
+        if self.cfg.norm_topk_prob:
+            denominator = topk_weights.sum(dim=-1, keepdim=True) + 1e-20
+            topk_weights /= denominator
+        topk_weights = topk_weights * self.cfg.routed_scaling_factor
+        return topk_indices, topk_weights
 
 
 class MoE(nn.Module):
-    def __init__(self, config: MoEConfig):
+    """Mixture of Experts с shared experts."""
+
+    def __init__(
+        self,
+        config: MoEConfig,
+    ) -> None:
         super().__init__()
+
         self.cfg = config
-        self.experts = nn.ModuleList([MLP(config.mlp) for _ in range(config.n_routed_experts)])
-        self.gate = TopkRouter(config)
+
+        # 64 эксперта
+        self.experts = nn.ModuleList([MLP(self.cfg.mlp) for _ in range(self.cfg.n_routed_experts)])
+
+        self.gate = TopkRouter(self.cfg)
+
+        # Shared expert
         self.shared_experts = MLP(
-            MLPConfig(config.hidden_size, config.moe_intermediate_size * config.n_shared_experts)
+            MLPConfig(
+                hidden_size=self.cfg.hidden_size,
+                intermediate_size=self.cfg.moe_intermediate_size * self.cfg.n_shared_experts,
+            )
         )
 
-    def moe(self, x, idx, w):
-        out = torch.zeros_like(x, dtype=w.dtype)
-        mask = F.one_hot(idx, num_classes=len(self.experts)).permute(2, 0, 1)
-        for ei in range(len(self.experts)):
-            ti, wi = torch.where(mask[ei])
-            if ti.numel() > 0:
-                out.index_add_(0, ti, self.experts[ei](x[ti]) * w[ti, wi].unsqueeze(-1))
-        return out.to(x.dtype)
+    def moe(
+        self, hidden_states: torch.Tensor, topk_indices: torch.Tensor, topk_weights: torch.Tensor
+    ) -> torch.Tensor:
+        final_hidden_states = torch.zeros_like(hidden_states, dtype=topk_weights.dtype)
+        expert_mask = torch.nn.functional.one_hot(
+            topk_indices, num_classes=len(self.experts)
+        ).permute(2, 0, 1)
 
-    def forward(self, x):
-        res = x
-        orig = x.shape
-        idx, w = self.gate(x)
-        x = x.view(-1, x.shape[-1])
-        return self.moe(x, idx, w).view(*orig) + self.shared_experts(res)
+        for expert_idx in range(len(self.experts)):
+            expert = self.experts[expert_idx]
+            mask = expert_mask[expert_idx]
+            token_indices, weight_indices = torch.where(mask)
+
+            if token_indices.numel() > 0:
+                expert_weights = topk_weights[token_indices, weight_indices]
+                expert_input = hidden_states[token_indices]
+                expert_output = expert(expert_input)
+                weighted_output = expert_output * expert_weights.unsqueeze(-1)
+                final_hidden_states.index_add_(0, token_indices, weighted_output)
+
+        return final_hidden_states.type(hidden_states.dtype)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        residuals = hidden_states
+        orig_shape = hidden_states.shape
+        topk_indices, topk_weights = self.gate(hidden_states)
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        hidden_states = self.moe(hidden_states, topk_indices, topk_weights).view(*orig_shape)
+        hidden_states = hidden_states + self.shared_experts(residuals)
+        return hidden_states
+
+
+class Attention(nn.Module):
+    """Multi-head attention с специфичной архитектурой Deepseek V3."""
+
+    def __init__(self, config: MoEAttentionConfig) -> None:
+        super().__init__()
+        self.cfg = config
+
+        self.q_proj = nn.Linear(
+            self.cfg.hidden_size,
+            self.cfg.num_attention_heads * self.cfg.qk_head_dim,
+            bias=self.cfg.attention_bias,
+        )
+
+        self.kv_a_proj_with_mqa = nn.Linear(
+            self.cfg.hidden_size,
+            self.cfg.kv_lora_rank + self.cfg.qk_rope_head_dim,
+            bias=self.cfg.attention_bias,
+        )
+
+        self.kv_a_layernorm = RMSNorm(self.cfg.rms_norm)
+
+        self.kv_b_proj = nn.Linear(
+            self.cfg.kv_lora_rank,
+            self.cfg.num_key_value_heads * (self.cfg.qk_nope_head_dim + self.cfg.v_head_dim),
+            bias=self.cfg.attention_bias,
+        )
+
+        self.o_proj = nn.Linear(
+            self.cfg.num_attention_heads * self.cfg.v_head_dim,
+            self.cfg.hidden_size,
+            bias=self.cfg.attention_bias,
+        )
+
+        self.scaling = self.cfg.qk_head_dim**-0.5
+        if self.cfg.rope_scaling is not None:
+            mscale_all_dim = self.cfg.rope_scaling.mscale_all_dim
+            scaling_factor = self.cfg.rope_scaling.factor
+            if mscale_all_dim:
+                mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
+                self.scaling = self.scaling * mscale * mscale
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        q_states = self.q_proj(hidden_states)
+        q_states = q_states.view(-1, self.cfg.num_attention_heads, self.cfg.qk_head_dim)
+
+        q_pass, q_rot = torch.split(
+            q_states, [self.cfg.qk_nope_head_dim, self.cfg.qk_rope_head_dim], dim=-1
+        )
+
+        compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
+        k_pass, k_rot = torch.split(
+            compressed_kv, [self.cfg.kv_lora_rank, self.cfg.qk_rope_head_dim], dim=-1
+        )
+
+        k_pass = self.kv_b_proj(self.kv_a_layernorm(k_pass))
+        k_pass = k_pass.view(
+            -1, self.cfg.num_key_value_heads, self.cfg.qk_nope_head_dim + self.cfg.v_head_dim
+        )
+
+        k_pass, value_states = torch.split(
+            k_pass, [self.cfg.qk_nope_head_dim, self.cfg.v_head_dim], dim=-1
+        )
+
+        # RoPE для вращающейся части
+        cos, sin = position_embeddings
+
+        k_rot = k_rot.unsqueeze(1)
+
+        # Применяем RoPE
+        q_rot, k_rot = apply_rotary_pos_emb_interleave_varlen(
+            q_rot, k_rot, cos, sin, unsqueeze_dim=1
+        )
+        k_rot = k_rot.expand(*k_pass.shape[:-1], -1)
+
+        query_states = torch.cat((q_pass, q_rot), dim=-1)
+        key_states = torch.cat((k_pass, k_rot), dim=-1)
+
+        # Flash Attention
+        attn_output = flash_attn_varlen_func(
+            query_states,
+            key_states,
+            value_states,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            softmax_scale=self.scaling,
+            dropout_p=self.cfg.attention_dropout if self.training else 0.0,
+            causal=True,
+        )
+
+        attn_output = attn_output.reshape(attn_output.shape[0], -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+
+        return attn_output
 
 
 class DecoderLayer(nn.Module):
-    def __init__(self, cfg: MoEDecoderLayerConfig, layer_idx: int):
+    def __init__(
+        self,
+        config: MoEDecoderLayerConfig,
+        layer_idx: int,
+    ):
         super().__init__()
-        self.cfg = cfg
+        self.cfg = config
         self.layer_idx = layer_idx
-        self.self_attn = Attention(cfg.attention)
-        self.mlp = (
-            MoE(config=cfg.moe) if layer_idx >= cfg.moe.first_k_dense_replace else MLP(cfg.mlp)
-        )
-        self.input_layernorm = RMSNorm(cfg.rms_norm)
-        self.post_attention_layernorm = RMSNorm(cfg.rms_norm)
 
-    def forward(self, x, cu, max_s, pos_emb, mask=None):
-        r = x
-        x = self.self_attn(self.input_layernorm(x), cu, max_s, pos_emb, mask)
-        x = r + x
-        r = x
-        x = self.mlp(self.post_attention_layernorm(x))
-        x = r + x
-        return x
+        self.self_attn = Attention(self.cfg.attention)
+
+        # Первый слой (layer_idx=0) - dense MLP, остальные - MoE
+        self.mlp: MoE | MLP
+        if layer_idx >= self.cfg.moe.first_k_dense_replace:
+            self.mlp = MoE(config=self.cfg.moe)
+        else:
+            self.mlp = MLP(config=self.cfg.mlp)
+
+        self.input_layernorm = RMSNorm(self.cfg.rms_norm)
+        self.post_attention_layernorm = RMSNorm(self.cfg.rms_norm)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # Self-attention с residual connection
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+
+        hidden_states = self.self_attn(
+            hidden_states=hidden_states,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+        )
+        hidden_states = residual + hidden_states
+
+        # MLP/MoE с residual connection
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+
+        return hidden_states
 
 
 class OmniModelMoE(nn.Module):
-    def __init__(self, cfg: OmniModelMoEConfig):
+    def __init__(self, config: OmniModelMoEConfig) -> None:
         super().__init__()
-        self.cfg = cfg
-        self.embed_tokens = nn.Embedding(
-            cfg.embeddings.vocab_size,
-            cfg.embeddings.hidden_size,
-            padding_idx=cfg.embeddings.pad_token_id,
-        )
-        self.layers = nn.ModuleList(
-            [DecoderLayer(cfg.decoder_layer, i) for i in range(cfg.num_hidden_layers)]
-        )
-        self.norm = RMSNorm(cfg.rms_norm)
 
-    def forward(self, input_ids, position_embeddings, position_ids, attention_mask=None):
-        x = self.embed_tokens(input_ids)
-        starts = torch.nonzero(position_ids == 0, as_tuple=False).flatten()
-        cu_t = torch.empty(starts.numel() + 1, device=position_ids.device, dtype=torch.int32)
-        cu_t[:-1] = starts.to(torch.int32)
-        cu_t[-1] = position_ids.numel()
-        max_s = int(position_ids.max().item()) + 1
+        self.cfg = config
+
+        self.embed_tokens = nn.Embedding(
+            self.cfg.embeddings.vocab_size,
+            self.cfg.embeddings.hidden_size,
+            padding_idx=self.cfg.embeddings.pad_token_id,
+        )
+
+        self.layers = nn.ModuleList(
+            [
+                DecoderLayer(self.cfg.decoder_layer, layer_idx=layer_idx)
+                for layer_idx in range(self.cfg.num_hidden_layers)
+            ]
+        )
+
+        self.norm = RMSNorm(self.cfg.rms_norm)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        position_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # Embeddings
+        hidden_states = self.embed_tokens(input_ids)
+
+        # cu_seqlens compute
+        cu_seqlens = []
+
+        for i, elem in enumerate(position_ids):
+            if elem == 0:
+                cu_seqlens.append(i)
+
+        cu_seqlens.append(len(position_ids))
+        cu_seqlens_tsr = torch.tensor(cu_seqlens, device=hidden_states.device, dtype=torch.int32)
+        max_seqlen = position_ids.max() + 1
+
+        # Forward через слои
         for layer in self.layers:
-            x = layer(x, cu_t, max_s, position_embeddings, attention_mask)
-        return self.norm(x)
+            hidden_states = layer(
+                hidden_states=hidden_states,
+                cu_seqlens=cu_seqlens_tsr,
+                max_seqlen=max_seqlen,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+            )
+
+        hidden_states = self.norm(hidden_states)
+        return hidden_states
+
+
+class CausalLM(nn.Module):
+    def __init__(self, config: OmniModelMoEConfig):
+        super().__init__()
+        self.model: OmniModelMoE
+        if isinstance(config, OmniModelMoEConfig):
+            self.model = OmniModelMoE(config)
+        else:
+            raise NotImplementedError
+
+        # LM Head
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor | None = None,
+        labels: torch.Tensor | None = None,
+        past_key_values: list[dict[str, typing.Any]] | None = None,
+        use_cache: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        output: dict[str, typing.Any] = {}
+
+        hidden_states = self.model(
+            input_ids=input_ids,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+        )
+        logits = self.lm_head(hidden_states)
+        output.update(
+            {
+                "logits": logits,
+                "hidden_states": hidden_states,
+            }
+        )
+
+        # Loss если есть labels
+        loss = None
+        if labels is not None:
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+
+            loss_fct = nn.CrossEntropyLoss()
+            flattened_logits = shift_logits.view(-1, shift_logits.size(-1))
+            flattened_labels = shift_labels.view(-1)
+            loss = loss_fct(flattened_logits, flattened_labels)
+
+        output["loss"] = loss
+
+        return output
+
+
+def create_model(config: OmniModelMoEConfig) -> CausalLM:
+    """OmniModel Dense / OmniModel MoE."""
+    return CausalLM(config)
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
