@@ -24,7 +24,8 @@ torch.distributed.group = MockDist.group
 
 from fastmoe.comm import get_ep_streams  # noqa
 from fastmoe.config import MoEScale, get_ep_cfg  # noqa
-from fastmoe.models.tiny_model import PipelineMoEBlock, Attention, TinyModel  # noqa
+from fastmoe.models.tiny_model import TinyModel, PipelineMoEBlock  # noqa
+from fastmoe.layers.common import Attention  # noqa
 
 
 class TestFastMoE(unittest.TestCase):

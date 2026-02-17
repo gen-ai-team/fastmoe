@@ -8,8 +8,9 @@ import torch.nn as nn
 from loguru import logger
 
 from fastmoe.config import EPConfig, MoEScale, get_ep_cfg
+from fastmoe.layers.common import Attention, Expert
 from fastmoe.models.router import TopKRouter
-from fastmoe.models.tiny_model import Attention, Expert, TinyModel
+from fastmoe.models.tiny_model import TinyModel
 
 
 # ==========================================
