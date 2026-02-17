@@ -57,3 +57,43 @@ def unpermute_from_ep(combined_output, gather_idx, perm_w, N, H):
     buffer.index_add_(0, valid_indices, valid_data)
 
     return buffer
+
+
+def build_mb_meta(pos_ids, pos_emb, seq_len, batch_size, n_mb):
+    """
+    Pre-compute metadata (cu_seqlens, RoPE slices) for each micro-batch.
+    """
+    # Validation
+    if batch_size % n_mb != 0:
+        # Fallback: if BS is small (e.g. 2) and n_mb is 4, force n_mb=1
+        if batch_size < n_mb:
+            n_mb = 1
+        else:
+            raise ValueError(f"Batch size {batch_size} not divisible by n_mb {n_mb}")
+
+    spb = batch_size // n_mb  # samples per micro-batch
+    tpb = spb * seq_len  # tokens per micro-batch
+
+    cos, sin = pos_emb
+
+    metas = []
+    for m in range(n_mb):
+        t0 = m * tpb
+        t1 = t0 + tpb
+
+        # cu_seqlens for this micro-batch
+        # Since inputs are uniform (padding-free in this context), it's a simple range
+        cu = list(range(0, tpb + 1, seq_len))
+
+        metas.append(
+            {
+                "t0": t0,
+                "t1": t1,
+                "cu": torch.tensor(cu, device=pos_ids.device, dtype=torch.int32),
+                "max_s": seq_len,
+                # Slice RoPE. Assuming flattened layout [Batch*Seq, HeadDim/2]
+                "cos": cos[t0:t1] if cos is not None else None,
+                "sin": sin[t0:t1] if sin is not None else None,
+            }
+        )
+    return metas
