@@ -103,7 +103,7 @@ class ReferenceBlock(nn.Module):
         ne = self.cfg.moe.num_experts_per_gpu * self.world_size
         cap = max(int(math.ceil(batch_size * self.cfg.moe.top_k / ne * 4.0)), 4)
 
-        perm_in, perm_w, gather_idx = permute_for_ep(x_flat, topk_idx, topk_w, ne, cap)
+        perm_in, perm_w, gather_idx, _ = permute_for_ep(x_flat, topk_idx, topk_w, ne, cap)
 
         # 5. Dispatch (Differentiable)
         nl = len(self.local_experts)
