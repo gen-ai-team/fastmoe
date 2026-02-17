@@ -2,7 +2,6 @@ import unittest
 from unittest.mock import patch
 
 import torch
-import torch.nn as nn
 
 # --- PATCHING (Mock CUDA & Distributed) ---
 # We must patch these BEFORE importing the models that might initialize things at module level.
@@ -24,57 +23,68 @@ torch.distributed.group = MockDist.group
 
 from fastmoe.comm import get_ep_streams  # noqa
 from fastmoe.config import MoEScale, get_ep_cfg  # noqa
-from fastmoe.models.tiny_model import TinyModel, PipelineMoEBlock  # noqa
 from fastmoe.layers.common import Attention  # noqa
+from fastmoe.layers.pipeline import PipelineMoELayer  # noqa
+from fastmoe.models.tiny_model import TinyDecoderLayer, TinyModel  # noqa
 
 
 class TestFastMoE(unittest.TestCase):
     def setUp(self):
         """Setup configuration and shared mocks for every test."""
         # 1. Create a standard Tiny Config
-        # We simulate world_size=2 to check split logic
         self.cfg = get_ep_cfg(world_size=2, scale=MoEScale.CI)
 
-        # 2. Mock the Stream Dictionary required by the new signature
-        # The model expects a dict of {Enum: Stream}
-        self.mock_streams = get_ep_streams()
+        # 2. Mock the Stream Dictionary
+        # Ensure comm.py returns valid objects (even if Mocks) for CPU testing
+        with patch("torch.cuda.is_available", return_value=True):
+            self.mock_streams = get_ep_streams()
 
-        # 3. Dummy Group (usually a ProcessGroupNCCL, passing a string/int is fine for mocks)
+        # 3. Dummy Group
         self.mock_group = "MOCK_GROUP"
 
-    def test_pipeline_block_structure_and_forward(self):
+    def test_pipeline_layer_structure_and_forward(self):
         """
-        Verifies that the PipelineMoEBlock instantiates correctly and runs
+        Verifies that PipelineMoELayer correctly wraps a DecoderLayer and runs
         a forward pass without crashing on CPU (via mocks).
         """
-        print("\n--- [Test] Pipeline Block Logic (CPU Mocked) ---")
+        print("\n--- [Test] Pipeline Layer Wrapper (CPU Mocked) ---")
 
         # Dimensions
         B, S, D = self.cfg.moe.batch_size, self.cfg.moe.seqlen, self.cfg.moe.hidden_dim
 
-        # Instantiate Block
-        # We test the "B1" style block which has both Pre and Post modules
-        block = PipelineMoEBlock(
-            cfg=self.cfg,
+        # 1. Create Inner Structure (Real Module)
+        inner_layer = TinyDecoderLayer(self.cfg, world_size=2)
+
+        # 2. Wrap it with Pipeline Layer
+        ep_layer = PipelineMoELayer(
+            layer=inner_layer,
+            rank=0,
+            world_size=2,
             group=self.mock_group,
-            block_name="TestBlock",
-            pre_op=Attention(D, self.cfg.moe.num_heads),
-            post_op=Attention(D, self.cfg.moe.num_heads),
             streams=self.mock_streams,
+            n_micro_batches=self.cfg.moe.micro_batches,
         )
 
         # Dummy Input
         x = torch.randn(B, S, D)
 
         # Execution
-        # This exercises the 5-stage loop, split logic, and event recording
-        out = block(x)
+        # This exercises the 5-stage loop, permute/unpermute logic, and event recording
+        out = ep_layer(x)
 
         # Assertions
         self.assertEqual(out.shape, (B, S, D), "Output shape mismatch")
-        self.assertIsInstance(block.pre_ops, Attention)
-        self.assertIsInstance(block.post_ops, Attention)
-        print("Pipeline forward pass successful.")
+
+        # Verify internal components are mapped correctly
+        self.assertIs(ep_layer.self_attn, inner_layer.self_attn)
+        self.assertIs(ep_layer.gate, inner_layer.mlp.gate)
+
+        # Verify sharding happened (Local experts should be subset of total)
+        total_experts = len(inner_layer.mlp.experts)
+        local_experts = len(ep_layer.local_experts)
+        self.assertEqual(local_experts, total_experts // 2, "Experts not sharded correctly")
+
+        print("Pipeline Layer forward pass successful.")
 
     def test_tiny_model_integration(self):
         """
@@ -82,19 +92,16 @@ class TestFastMoE(unittest.TestCase):
         """
         print("\n--- [Test] Full TinyModel Integration ---")
 
-        # Patch `get_ep_streams` inside `tiny_model.py` to return our mock dictionary
-        # instead of trying to create real CUDA streams inside the model __init__
+        # Patch `get_ep_streams` inside `tiny_model.py`
         with patch("fastmoe.models.tiny_model.get_ep_streams", return_value=self.mock_streams):
             model = TinyModel(cfg=self.cfg, group=self.mock_group)
 
             # Verify structure
-            # Block 0 should have Pre=Attn, Post=Attn
-            self.assertIsInstance(model.blocks[0].pre_ops, Attention)
-            self.assertIsInstance(model.blocks[0].post_ops, Attention)
+            # Block 0 should be a PipelineMoELayer
+            self.assertIsInstance(model.blocks[0], PipelineMoELayer)
 
-            # Block 1 (Last block) should have Pre=Identity (None), Post=Linear
-            self.assertIsInstance(model.blocks[1].pre_ops, nn.Identity)
-            self.assertIsInstance(model.blocks[1].post_ops, nn.Linear)
+            # Verify the inner layer type
+            self.assertIsInstance(model.blocks[0].self_attn, Attention)
 
             # Forward Pass
             x = torch.randn(self.cfg.moe.batch_size, 10, self.cfg.moe.hidden_dim)
