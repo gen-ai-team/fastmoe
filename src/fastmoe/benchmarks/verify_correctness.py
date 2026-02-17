@@ -9,7 +9,7 @@ from loguru import logger
 
 from fastmoe.config import Config, MoEScale, get_cfg
 from fastmoe.models.router import TopKRouter
-from fastmoe.models.tiny_model import Expert, SelfAttention, TinyModel
+from fastmoe.models.tiny_model import Attention, Expert, TinyModel
 
 
 # ==========================================
@@ -135,9 +135,9 @@ class ReferenceTinyModel(nn.Module):
         self.input_proj = nn.Linear(cfg.moe.hidden_dim, cfg.moe.hidden_dim)
         self.blocks = nn.ModuleList()
         for i in range(cfg.moe.n_blocks):
-            pre = SelfAttention(cfg.moe.hidden_dim, cfg.moe.num_heads) if i == 0 else None
+            pre = Attention(cfg.moe.hidden_dim, cfg.moe.num_heads) if i == 0 else None
             post = (
-                SelfAttention(cfg.moe.hidden_dim, cfg.moe.num_heads)
+                Attention(cfg.moe.hidden_dim, cfg.moe.num_heads)
                 if i < cfg.moe.n_blocks - 1
                 else nn.Linear(cfg.moe.hidden_dim, cfg.moe.hidden_dim)
             )

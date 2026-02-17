@@ -24,7 +24,7 @@ torch.distributed.group = MockDist.group
 
 from fastmoe.comm import get_ep_streams  # noqa
 from fastmoe.config import MoEScale, get_cfg  # noqa
-from fastmoe.models.tiny_model import PipelineMoEBlock, SelfAttention, TinyModel  # noqa
+from fastmoe.models.tiny_model import PipelineMoEBlock, Attention, TinyModel  # noqa
 
 
 class TestFastMoE(unittest.TestCase):
@@ -57,8 +57,8 @@ class TestFastMoE(unittest.TestCase):
             cfg=self.cfg,
             group=self.mock_group,
             block_name="TestBlock",
-            pre_op_module=SelfAttention(D, self.cfg.moe.num_heads),
-            post_op_module=SelfAttention(D, self.cfg.moe.num_heads),
+            pre_op_module=Attention(D, self.cfg.moe.num_heads),
+            post_op_module=Attention(D, self.cfg.moe.num_heads),
             streams=self.mock_streams,
         )
 
@@ -71,8 +71,8 @@ class TestFastMoE(unittest.TestCase):
 
         # Assertions
         self.assertEqual(out.shape, (B, S, D), "Output shape mismatch")
-        self.assertIsInstance(block.pre_ops, SelfAttention)
-        self.assertIsInstance(block.post_ops, SelfAttention)
+        self.assertIsInstance(block.pre_ops, Attention)
+        self.assertIsInstance(block.post_ops, Attention)
         print("Pipeline forward pass successful.")
 
     def test_tiny_model_integration(self):
@@ -88,8 +88,8 @@ class TestFastMoE(unittest.TestCase):
 
             # Verify structure
             # Block 0 should have Pre=Attn, Post=Attn
-            self.assertIsInstance(model.blocks[0].pre_ops, SelfAttention)
-            self.assertIsInstance(model.blocks[0].post_ops, SelfAttention)
+            self.assertIsInstance(model.blocks[0].pre_ops, Attention)
+            self.assertIsInstance(model.blocks[0].post_ops, Attention)
 
             # Block 1 (Last block) should have Pre=Identity (None), Post=Linear
             self.assertIsInstance(model.blocks[1].pre_ops, nn.Identity)
