@@ -108,7 +108,11 @@ def worker(rank, world_size):
     cfg = get_ep_cfg(world_size=world_size, scale=MoEScale.TINY)
     dtype = torch.float32
 
-    pipe = PipelineMoEBlock(cfg, dist.group.WORLD, get_ep_streams()).cuda().to(dtype)
+    pipe = (
+        PipelineMoEBlock(cfg, dist.group.WORLD, get_ep_streams(), pre_op=None, post_op=None)
+        .cuda()
+        .to(dtype)
+    )
     ref = ReferenceBlock(cfg, dist.group.WORLD).cuda().to(dtype)
 
     with torch.no_grad():
