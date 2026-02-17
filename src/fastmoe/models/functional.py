@@ -42,13 +42,11 @@ def unpermute_from_ep(combined_output, gather_idx, perm_w, N, H):
     Scatters expert outputs back to original token positions.
     """
     # combined: [NumExperts * Capacity, H]
-    # gather_idx: [NumExperts * Capacity] (values are 0..N)
-    # perm_w: [NumExperts * Capacity]
+    # perm_w:   [NumExperts * Capacity]
 
-    # 1. Weight the outputs
-    weighted_out = combined_output * perm_w.unsqueeze(1)
+    w_casted = perm_w.to(dtype=combined_output.dtype)
+    weighted_out = combined_output * w_casted.unsqueeze(1)
 
-    # 2. Scatter Add
     # Output buffer: [N, H]
     buffer = torch.zeros(N, H, dtype=combined_output.dtype, device=combined_output.device)
 
