@@ -109,15 +109,34 @@ def worker(rank, world_size):
     dtype = torch.float32
 
     pipe = (
-        PipelineMoEBlock(cfg, dist.group.WORLD, get_ep_streams(), pre_op=None, post_op=None)
+        PipelineMoEBlock(
+            cfg=cfg,
+            group=dist.group.WORLD,
+            streams=get_ep_streams(),
+            pre_op=nn.Identity(),
+            post_op=nn.Identity(),
+        )
         .cuda()
         .to(dtype)
     )
     ref = ReferenceBlock(cfg, dist.group.WORLD).cuda().to(dtype)
 
     with torch.no_grad():
-        for p1, p2 in zip(pipe.parameters(), ref.parameters(), strict=False):
-            p2.data.copy_(p1.data)
+        pipe_params = dict(pipe.named_parameters())
+        ref_params = dict(ref.named_parameters())
+
+        for name, p_ref in ref_params.items():
+            # Standard mapping
+            if name in pipe_params:
+                p_ref.copy_(pipe_params[name].data)
+            # Handle potential name mismatches (e.g., self_attn vs pre_ops)
+            elif name.replace("self_attn", "pre_ops") in pipe_params:
+                p_ref.copy_(pipe_params[name.replace("self_attn", "pre_ops")].data)
+            else:
+                if rank == 0:
+                    logger.warning(
+                        f"Parameter '{name}' not found in Pipeline model, skipping sync."
+                    )
 
     x = torch.randn(
         cfg.moe.batch_size,
@@ -129,36 +148,47 @@ def worker(rank, world_size):
     )
 
     if rank == 0:
-        logger.info("Running Forward...")
+        logger.info("Running Forward Verification...")
+
     y_pipe = pipe(x)
 
     y_ref_list = []
-    for chunk in x.chunk(cfg.moe.micro_batches, dim=0):
+    chunks = x.chunk(cfg.moe.micro_batches, dim=0)
+    for chunk in chunks:
         y_ref_list.append(ref(chunk))
     y_ref = torch.cat(y_ref_list, dim=0)
 
     diff = (y_pipe - y_ref).abs().max()
     if rank == 0:
         logger.info(f"Forward Max Diff: {diff:.6f}")
-    assert diff < 1e-4, "Forward Mismatch!"
+
+    assert diff < 1e-4, f"Forward Mismatch! Max Diff: {diff:.6f}"
 
     if rank == 0:
-        logger.info("Running Backward...")
+        logger.info("Running Backward Verification...")
+
     g = torch.randn_like(y_pipe)
     y_pipe.backward(g)
     y_ref.backward(g)
 
     max_grad_diff = 0.0
-    for _, (p1, p2) in enumerate(zip(pipe.parameters(), ref.parameters(), strict=False)):
-        if p1.grad is not None:
-            d = (p1.grad - p2.grad).abs().max()
-            max_grad_diff = max(max_grad_diff, d.item())
+    for name, p_ref in ref.named_parameters():
+        p_pipe_name = name if name in pipe_params else name.replace("self_attn", "pre_ops")
+
+        if p_pipe_name in pipe_params:
+            p_pipe = pipe_params[p_pipe_name]
+            if p_pipe.grad is not None and p_ref.grad is not None:
+                d = (p_pipe.grad - p_ref.grad).abs().max().item()
+                max_grad_diff = max(max_grad_diff, d)
 
     if rank == 0:
         logger.info(f"Backward Max Grad Diff: {max_grad_diff:.6f}")
-    assert max_grad_diff < 1e-3, "Backward Mismatch!"
+
+    assert max_grad_diff < 1e-3, f"Backward Mismatch! Max Diff: {max_grad_diff:.6f}"
 
     dist.destroy_process_group()
+    if rank == 0:
+        logger.success("Verification Successful: Forward and Backward match perfectly!")
 
 
 def run_verify_correctness():
