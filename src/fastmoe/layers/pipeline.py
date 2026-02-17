@@ -117,7 +117,10 @@ class PipelineMoELayer(nn.Module):
         s = rank * self.nl
         self.local_experts = nn.ModuleList([all_experts[i] for i in range(s, s + self.nl)])
 
-        self.top_k = layer.cfg.moe.top_k
+        try:
+            self.top_k = layer.cfg.moe.top_k
+        except AttributeError:
+            self.top_k = layer.cfg.moe.num_experts_per_tok
         self.cap_factor = 4.0
         self._metas = None
 
