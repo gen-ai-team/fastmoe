@@ -138,14 +138,10 @@ class ReferenceBlock(nn.Module):
 
 
 def check_relative(name, t_pipe, t_ref, tol=1e-3):
-    # 1. Calculate the magnitude (Norm) of the reference gradient
     ref_norm = t_ref.norm().item()
 
-    # 2. Calculate the difference
     diff = (t_pipe - t_ref).abs().max().item()
 
-    # 3. Calculate Relative Error
-    # Avoid division by zero
     if ref_norm < 1e-6:
         rel_error = 0.0
     else:

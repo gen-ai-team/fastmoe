@@ -97,7 +97,10 @@ class PipelineMoELayer(nn.Module):
         self.streams = streams
         self.n_mb = n_micro_batches
 
-        H = layer.input_layernorm.normalized_shape[0]
+        try:
+            H = layer.input_layernorm.normalized_shape[0]
+        except AttributeError:
+            H = layer.cfg.rms_norm.hidden_size
         self.H = H
 
         # Modules
