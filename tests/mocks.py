@@ -73,21 +73,21 @@ class MockDist:
 
     @staticmethod
     def all_to_all_single(output, input, group=None, async_op=False):
-        # Simulate data transfer by just copying input to output (if shapes match)
-        # or doing nothing since it's a mock.
-        # In a real unit test, we might want to check shapes.
+        # Identity communication: tokens stay on the same 'rank'
         if output.shape == input.shape:
             output.copy_(input)
-        if async_op:
-            return MockWork()
+        return MockWork() if async_op else None
 
     @staticmethod
-    def get_world_size():
-        return 2  # Simulate 2 GPUs
+    def get_world_size(group=None):
+        return 2
 
     @staticmethod
-    def get_rank():
+    def get_rank(group=None):
         return 0
 
+    def barrier(self, group=None):
+        pass
+
     class group:
-        WORLD = "WORLD"
+        WORLD = "MOCK_WORLD"

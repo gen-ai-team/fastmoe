@@ -23,7 +23,7 @@ torch.distributed.group = MockDist.group
 # ----------------------------
 
 from fastmoe.comm import get_ep_streams  # noqa
-from fastmoe.config import MoEScale, get_cfg  # noqa
+from fastmoe.config import MoEScale, get_ep_cfg  # noqa
 from fastmoe.models.tiny_model import PipelineMoEBlock, Attention, TinyModel  # noqa
 
 
@@ -32,7 +32,7 @@ class TestFastMoE(unittest.TestCase):
         """Setup configuration and shared mocks for every test."""
         # 1. Create a standard Tiny Config
         # We simulate world_size=2 to check split logic
-        self.cfg = get_cfg(world_size=2, scale=MoEScale.CI)
+        self.cfg = get_ep_cfg(world_size=2, scale=MoEScale.CI)
 
         # 2. Mock the Stream Dictionary required by the new signature
         # The model expects a dict of {Enum: Stream}
@@ -57,8 +57,8 @@ class TestFastMoE(unittest.TestCase):
             cfg=self.cfg,
             group=self.mock_group,
             block_name="TestBlock",
-            pre_op_module=Attention(D, self.cfg.moe.num_heads),
-            post_op_module=Attention(D, self.cfg.moe.num_heads),
+            pre_op=Attention(D, self.cfg.moe.num_heads),
+            post_op=Attention(D, self.cfg.moe.num_heads),
             streams=self.mock_streams,
         )
 

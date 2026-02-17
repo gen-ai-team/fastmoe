@@ -39,8 +39,7 @@ lint:
 # Runs the CPU correctness test suite (Stale Pointer Bug check)
 # We export CUDA_VISIBLE_DEVICES= to force CPU even if running on a GPU machine
 test:
-	export CUDA_VISIBLE_DEVICES= && $(UV) run python tests/test_cpu_moe.py
-
+	export CUDA_VISIBLE_DEVICES= && PYTHONPATH=src uv run python tests/test_cpu_moe.py
 # ---- Housekeeping ------------------------------------------------------------
 clean:
 	find . -name "__pycache__" -type d -exec rm -rf {} + || true

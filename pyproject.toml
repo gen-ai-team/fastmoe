@@ -65,3 +65,8 @@ ignore_missing_imports = true
 warn_unused_ignores = true
 warn_redundant_casts = true
 strict_optional = true
+
+[dependency-groups]
+dev = [
+    "ruff>=0.14.8",
+]

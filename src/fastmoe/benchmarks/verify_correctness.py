@@ -7,7 +7,7 @@ import torch.multiprocessing as mp
 import torch.nn as nn
 from loguru import logger
 
-from fastmoe.config import Config, MoEScale, get_cfg
+from fastmoe.config import EPConfig, MoEScale, get_ep_cfg
 from fastmoe.models.router import TopKRouter
 from fastmoe.models.tiny_model import Attention, Expert, TinyModel
 
@@ -49,7 +49,7 @@ class DifferentiableAllToAll(torch.autograd.Function):
 # 1. Reference Block (Synchronous MoE)
 # ==========================================
 class ReferenceMoEBlock(nn.Module):
-    def __init__(self, cfg: Config, group, pre_op, post_op):
+    def __init__(self, cfg: EPConfig, group, pre_op, post_op):
         super().__init__()
         self.cfg = cfg
         self.group = group
@@ -216,7 +216,7 @@ def worker(rank, world_size):
 
     torch.manual_seed(42 + rank)
 
-    cfg = get_cfg(world_size=world_size, scale=MoEScale.TINY)
+    cfg = get_ep_cfg(world_size=world_size, scale=MoEScale.TINY)
     cfg.moe.batch_size = 32  # Small batch
 
     pipe_model = TinyModel(cfg, dist.group.WORLD).cuda()
