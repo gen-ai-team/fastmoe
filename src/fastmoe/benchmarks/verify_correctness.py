@@ -145,7 +145,7 @@ def worker(rank, world_size):
     torch.manual_seed(42 + rank)
 
     cfg = get_ep_cfg(world_size=world_size, scale=MoEScale.TINY)
-    dtype = torch.float32
+    dtype = torch.float64
 
     # 1. Setup Models
     mock_layer_struct = MockLayer(cfg, world_size).cuda().to(dtype)
