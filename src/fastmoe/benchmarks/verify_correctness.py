@@ -6,6 +6,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
 from loguru import logger
+from torch.autograd import Function
 
 from fastmoe.comm import get_ep_streams
 from fastmoe.config import EPConfig, MoEScale, get_ep_cfg
@@ -14,7 +15,23 @@ from fastmoe.models.functional import permute_for_ep, unpermute_from_ep
 from fastmoe.models.router import TopKRouter
 
 
-# --- Mock Structures (Correct) ---
+# --- Helper: Differentiable All-to-All for Reference ---
+class DiffAllToAll(Function):
+    @staticmethod
+    def forward(ctx, x, group):
+        ctx.group = group
+        y = torch.empty_like(x)
+        dist.all_to_all_single(y, x, group=group)
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad_input = torch.empty_like(grad_output)
+        dist.all_to_all_single(grad_input, grad_output, group=ctx.group)
+        return grad_input, None
+
+
+# --- Mock Structures ---
 class MockMlp(nn.Module):
     def __init__(self, cfg: EPConfig, world_size):
         super().__init__()
@@ -44,7 +61,7 @@ class MockLayer(nn.Module):
         self.mlp = MockMlp(cfg, world_size)
 
 
-# --- Reference Block (Fixed) ---
+# --- Reference Block (With Autograd Support) ---
 class ReferenceBlock(nn.Module):
     def __init__(self, cfg, world_size):
         super().__init__()
@@ -71,7 +88,7 @@ class ReferenceBlock(nn.Module):
     def forward(self, x):
         # 1. Pre-Ops
         x_norm = self.input_layernorm(x)
-        x_resid = x + x_norm  # Identity Attn
+        x_resid = x + x_norm
         x_post_norm = self.post_attention_layernorm(x_resid)
 
         # 2. Shared Experts
@@ -88,14 +105,14 @@ class ReferenceBlock(nn.Module):
 
         perm_in, perm_w, gather_idx = permute_for_ep(x_flat, topk_idx, topk_w, ne, cap)
 
-        # 5. Dispatch
+        # 5. Dispatch (Differentiable)
         nl = len(self.local_experts)
         tokens_per_rank = nl * cap
         H = self.cfg.moe.hidden_dim
 
         send_disp = perm_in.view(self.world_size, tokens_per_rank, H)
-        recv_disp = torch.empty_like(send_disp)
-        dist.all_to_all_single(recv_disp, send_disp)
+        # Use Custom Function to keep graph connected
+        recv_disp = DiffAllToAll.apply(send_disp, dist.group.WORLD)
 
         # 6. Experts
         dispatched_input = recv_disp.view(self.world_size, nl, cap, H)
@@ -105,22 +122,21 @@ class ReferenceBlock(nn.Module):
             torch.stack(expert_outs).view(nl, self.world_size, cap, H).transpose(0, 1)
         )
 
-        # 7. Combine
+        # 7. Combine (Differentiable)
         send_comb = expert_out_stack.contiguous().view(self.world_size, tokens_per_rank, H)
-        recv_comb = torch.empty_like(send_comb)
-        dist.all_to_all_single(recv_comb, send_comb)
+        recv_comb = DiffAllToAll.apply(send_comb, dist.group.WORLD)
         combined_output = recv_comb.view(-1, H)
 
         # 8. Unpermute & Post-Ops
         routed_out = unpermute_from_ep(combined_output, gather_idx, perm_w, batch_size, H)
 
+        # View as 3D to match residual
         routed_out = routed_out.view_as(x_resid)
         shared_out = shared_out.view_as(x_resid)
 
         return x_resid + routed_out + shared_out
 
 
-# --- Worker (Fixed) ---
 def worker(rank, world_size):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "12399"
@@ -133,7 +149,6 @@ def worker(rank, world_size):
 
     # 1. Setup Models
     mock_layer_struct = MockLayer(cfg, world_size).cuda().to(dtype)
-
     pipe = (
         PipelineMoELayer(
             mock_layer_struct,
@@ -159,7 +174,12 @@ def worker(rank, world_size):
 
     # 3. Input
     x = torch.randn(
-        cfg.moe.batch_size, cfg.moe.seqlen, cfg.moe.hidden_dim, device="cuda", dtype=dtype
+        cfg.moe.batch_size,
+        cfg.moe.seqlen,
+        cfg.moe.hidden_dim,
+        device="cuda",
+        dtype=dtype,
+        requires_grad=True,
     )
 
     # 4. Pipeline Metadata
@@ -168,16 +188,45 @@ def worker(rank, world_size):
         {"t0": i * chunk_size, "t1": (i + 1) * chunk_size} for i in range(cfg.moe.micro_batches)
     ]
 
-    # 5. Execute & Compare
+    # 5. Forward
     y_pipe = pipe(x)
-    y_ref = ref(x)  # Reference runs the full batch (simulating full non-pipelined pass)
+    y_ref = ref(x)
 
     diff = (y_pipe - y_ref).abs().max().item()
-
     if rank == 0:
         logger.info(f"Forward Max Diff: {diff:.6f}")
+    assert diff < 1e-4, f"Forward Mismatch! {diff}"
 
-    assert diff < 1e-4, f"Mismatch! Diff: {diff:.6f}"
+    # 6. Backward Verification
+    if rank == 0:
+        logger.info("Running Backward Verification...")
+
+    g = torch.randn_like(y_pipe)
+    y_pipe.backward(g)
+    y_ref.backward(g)
+
+    # Check Shared Experts Grads
+    d_shared = (pipe.shared_experts.weight.grad - ref.shared_experts.weight.grad).abs().max().item()
+    if rank == 0:
+        logger.info(f"Shared Expert Grad Diff: {d_shared:.6f}")
+    assert d_shared < 1e-3, f"Shared Grad Mismatch: {d_shared}"
+
+    # Check Router Grads
+    d_gate = (pipe.gate.gate.weight.grad - ref.gate.gate.weight.grad).abs().max().item()
+    if rank == 0:
+        logger.info(f"Router Grad Diff: {d_gate:.6f}")
+    assert d_gate < 1e-3, f"Router Grad Mismatch: {d_gate}"
+
+    # Check Local Experts Grads
+    for i, expert in enumerate(pipe.local_experts):
+        ref_expert = ref.local_experts[i]
+        for p1, p2 in zip(expert.parameters(), ref_expert.parameters(), strict=False):
+            if p1.grad is not None:
+                d_exp = (p1.grad - p2.grad).abs().max().item()
+                assert d_exp < 1e-3, f"Expert {i} Grad Mismatch: {d_exp}"
+
+    if rank == 0:
+        logger.success("Verification Successful: Forward and Backward match!")
 
     dist.destroy_process_group()
 
