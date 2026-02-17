@@ -3,9 +3,9 @@ name = "fastmoe"
 version = "0.1.0"
 description = "High-performance Expert Parallelism with Fused Kernels"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.13"
 dependencies = [
-    "torch",
+    "torch>=2.5.0",
     "numpy",
     "matplotlib",
     "triton; sys_platform == 'linux'",
@@ -16,7 +16,6 @@ dependencies = [
 
 [project.optional-dependencies]
 flash = [
-    # Flash Attention also generally requires CUDA/Linux
     "flash-attn==2.8.3; sys_platform == 'linux'",
 ]
 dev = [
@@ -30,10 +29,21 @@ profiling = [
   "tensorboard>=2.13",
 ]
 
+
+[tool.uv]
+# Это заставляет uv брать бинарник по ссылке, а не из PyPI
+# Если нужно будет запустить на Python 3.12, ссылку придется поменять
+[tool.uv.sources]
+flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.5cxx11abiFALSE-cp313-cp313-linux_x86_64.whl" }
+
+[tool.uv.extra-build-dependencies]
+flash-attn = ["torch>=2.5.0", "setuptools", "packaging", "ninja"]
+
 [[tool.uv.dependency-metadata]]
 name = "flash-attn"
 version = "2.8.3"
 requires-dist = ["torch", "einops"]
+
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/fastmoe"]
@@ -41,21 +51,20 @@ packages = ["src/fastmoe"]
 [tool.hatch.build.targets.editable]
 packages = ["src/fastmoe"]
 
-# [tool.uv.extra-build-dependencies]
-# flash-attn = [{ requirement = "torch", match-runtime = true }]
-
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py313"
+
+[tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
 ignore = ["E203"]
 
 [tool.black]
 line-length = 100
-target-version = ["py310"]
+target-version = ["py313"]
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.13"
 ignore_missing_imports = true
 warn_unused_ignores = true
 warn_redundant_casts = true

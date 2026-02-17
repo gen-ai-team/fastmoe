@@ -1,13 +1,13 @@
 import functools
 import sys
-from enum import Enum
+from enum import StrEnum
 
 from loguru import logger
 from pydantic import Field
 from pydantic_settings import BaseSettings
 
 
-class MoEScale(str, Enum):
+class MoEScale(StrEnum):
     TINY = "tiny"
     CI = "ci"  # CI scale for GitHub Actions
 
