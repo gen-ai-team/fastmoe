@@ -148,17 +148,19 @@ class PipelineMoELayer(nn.Module):
             x_post_norm = self.post_attention_layernorm(x_after_attn)
             ctx[mb]["x_post_norm"] = x_post_norm  # Save for backward
             x_flat = x_post_norm.view(-1, self.H)
-
             topk_idx, topk_w = self.gate(x_flat)
             cap = self._cap(x_flat.shape[0])
 
-            perm_in, perm_w, gather_idx = permute_for_ep(x_flat, topk_idx, topk_w, self.ne, cap)
+            perm_in, perm_w, gather_idx, k_src = permute_for_ep(
+                x_flat, topk_idx, topk_w, self.ne, cap
+            )
 
             ctx[mb].update(
                 {
                     "perm_in": perm_in.detach(),
                     "perm_w": perm_w,
                     "gather_idx": gather_idx,
+                    "k_src": k_src,  # Save for backward
                     "cap": cap,
                     "res_moe": x_after_attn.detach(),
                     "shared_in": x_flat.detach(),
@@ -369,27 +371,31 @@ class PipelineMoELayer(nn.Module):
         with torch.cuda.stream(stream):
             d_perm_in = ctx[mb]["d_perm_in"]
 
-            # Reverse Permute (Gather -> Scatter)
-            # Forward: perm_in[i] = x_flat[gather_idx[i]]
-            # Backward: d_x_flat.index_add_(gather_idx, d_perm_in)
-
-            d_x_routed = torch.zeros_like(ctx[mb]["shared_in"])  # [N, H]
+            # 1. Reverse Permute (Gather -> Scatter) for Data
+            d_x_routed = torch.zeros_like(ctx[mb]["shared_in"])
             valid = ctx[mb]["gather_idx"] != -1
             gather_idx = ctx[mb]["gather_idx"][valid]
-
             d_x_routed.index_add_(0, gather_idx, d_perm_in[valid])
 
-            # Backward for Gate (TopK Router)
+            # 2. Backward for Gate (TopK Router)
             x_post_norm = ctx[mb]["x_post_norm"].detach().requires_grad_(True)
             x_flat = x_post_norm.view(-1, self.H)
 
             with torch.enable_grad():
-                # Re-run gate to get graph
-                _, pw = self.gate(x_flat)
+                _, pw = self.gate(x_flat)  # pw is [N, K]
 
-            # Propagate d_perm_w into Gate
-            # Note: We only propagate gradients into the weights (pw), not the indices
-            torch.autograd.backward(pw, ctx[mb]["d_perm_w"])
+            d_perm_w = ctx[mb]["d_perm_w"]  # [TotalSlots]
+            k_src = ctx[mb]["k_src"]  # [TotalSlots]
+
+            d_pw_flat = torch.zeros_like(pw.view(-1))
+            valid_src = k_src != -1
+
+            # Map gradients back to the original [Batch, K] slot
+            d_pw_flat.index_add_(0, k_src[valid_src], d_perm_w[valid_src])
+
+            # Now we have correct shape [N, K]
+            torch.autograd.backward(pw, d_pw_flat.view_as(pw))
+
             d_x_gate = x_post_norm.grad
 
             # Total Gradient at Post-Attention LN output
