@@ -255,17 +255,18 @@ class PipelineMoELayer(nn.Module):
         stream = self.streams[Streams.COMPUTE]
         with torch.cuda.stream(stream):
             d_final = grad_chunks[mb]
-            ctx[mb]["d_final"] = d_final  # Save for Stage 4 & 1
+            ctx[mb]["d_final"] = d_final  # Save 3D version for Stage 1 (Residual)
 
             # 1. Gradient for Shared Experts
-            # Reconstruct graph leaf
             x_post_norm = ctx[mb]["x_post_norm"].detach().requires_grad_(True)
             x_flat = x_post_norm.view(-1, self.H)
 
-            # Run Shared Expert forward again to connect autograd
+            # Re-run forward to rebuild graph
             with torch.enable_grad():
-                s_out = self.shared_experts(x_flat)
-            torch.autograd.backward(s_out, d_final)
+                s_out = self.shared_experts(x_flat)  # Output is 2D [N, H]
+
+            torch.autograd.backward(s_out, d_final.view(-1, self.H))
+
             ctx[mb]["d_x_post_norm_shared"] = x_post_norm.grad
 
         if ev_signal[mb]:
