@@ -140,20 +140,33 @@ class PipelineMoELayer(nn.Module):
         stream = self.streams[Streams.COMPUTE]
         with torch.cuda.stream(stream):
             x_mb = chunks[mb]
-            ctx[mb]["x_in"] = x_mb  # Save for backward
+            ctx[mb]["x_in"] = x_mb
 
             x_normed = self.input_layernorm(x_mb)
+
             if isinstance(self.self_attn, nn.Identity):
                 attn_out = x_normed
             else:
-                attn_out = self.self_attn(x_normed)
+                if metas and isinstance(metas, list) and len(metas) > mb and "cu" in metas[mb]:
+                    mi = metas[mb]
+
+                    pe = (mi["cos"], mi["sin"])
+                    attn_out = self.self_attn(
+                        x_normed,
+                        cu_seqlens=mi["cu"],
+                        max_seqlen=mi["max_s"],
+                        position_embeddings=pe,
+                    )
+                else:
+                    attn_out = self.self_attn(x_normed)
 
             x_after_attn = x_mb + attn_out
-            ctx[mb]["x_after_attn"] = x_after_attn  # Save for backward
+            ctx[mb]["x_after_attn"] = x_after_attn
 
             x_post_norm = self.post_attention_layernorm(x_after_attn)
-            ctx[mb]["x_post_norm"] = x_post_norm  # Save for backward
+            ctx[mb]["x_post_norm"] = x_post_norm
             x_flat = x_post_norm.view(-1, self.H)
+
             topk_idx, topk_w = self.gate(x_flat)
             cap = self._cap(x_flat.shape[0])
 
@@ -166,7 +179,7 @@ class PipelineMoELayer(nn.Module):
                     "perm_in": perm_in.detach(),
                     "perm_w": perm_w,
                     "gather_idx": gather_idx,
-                    "k_src": k_src,  # Save for backward
+                    "k_src": k_src,
                     "cap": cap,
                     "res_moe": x_after_attn.detach(),
                     "shared_in": x_flat.detach(),
@@ -377,20 +390,17 @@ class PipelineMoELayer(nn.Module):
         with torch.cuda.stream(stream):
             d_perm_in = ctx[mb]["d_perm_in"]
 
-            # 1. Reverse Permute (Gather -> Scatter)
             d_x_routed = torch.zeros_like(ctx[mb]["shared_in"])
             valid = ctx[mb]["gather_idx"] != -1
             gather_idx = ctx[mb]["gather_idx"][valid]
             d_x_routed.index_add_(0, gather_idx, d_perm_in[valid])
 
-            # 2. Backward for Gate
             x_post_norm = ctx[mb]["x_post_norm"].detach().requires_grad_(True)
             x_flat = x_post_norm.view(-1, self.H)
 
             with torch.enable_grad():
                 _, pw = self.gate(x_flat)
 
-            # Scatter d_perm_w back to d_pw
             d_perm_w = ctx[mb]["d_perm_w"]
             k_src = ctx[mb]["k_src"]
             d_pw_flat = torch.zeros_like(pw.view(-1))
@@ -398,19 +408,18 @@ class PipelineMoELayer(nn.Module):
             d_pw_flat.index_add_(0, k_src[valid_src], d_perm_w[valid_src])
 
             torch.autograd.backward(pw, d_pw_flat.view_as(pw))
-            d_x_gate = x_post_norm.grad
 
-            if d_x_gate is None:
-                d_x_gate = torch.zeros_like(x_post_norm)
+            d_x_gate = (
+                x_post_norm.grad if x_post_norm.grad is not None else torch.zeros_like(x_post_norm)
+            )
+            d_x_shared = (
+                ctx[mb]["d_x_post_norm_shared"]
+                if ctx[mb]["d_x_post_norm_shared"] is not None
+                else torch.zeros_like(x_post_norm)
+            )
 
-            d_x_shared = ctx[mb]["d_x_post_norm_shared"]
-            if d_x_shared is None:
-                d_x_shared = torch.zeros_like(x_post_norm)
-
-            # Sum gradients
             d_x_post_norm = d_x_routed.view_as(x_post_norm) + d_x_gate + d_x_shared
 
-            # 3. Backward for Pre-Ops
             x_in = ctx[mb]["x_in"].detach().requires_grad_(True)
             x_after_attn = ctx[mb]["x_after_attn"].detach().requires_grad_(True)
             d_final = ctx[mb]["d_final"]
@@ -418,10 +427,23 @@ class PipelineMoELayer(nn.Module):
             with torch.enable_grad():
                 x_post = self.post_attention_layernorm(x_after_attn)
                 x_normed = self.input_layernorm(x_in)
+
                 if isinstance(self.self_attn, nn.Identity):
                     attn = x_normed
                 else:
-                    attn = self.self_attn(x_normed)
+                    metas = self._metas
+                    if metas and isinstance(metas, list) and len(metas) > mb and "cu" in metas[mb]:
+                        mi = metas[mb]
+                        pe = (mi["cos"], mi["sin"])
+                        attn = self.self_attn(
+                            x_normed,
+                            cu_seqlens=mi["cu"],
+                            max_seqlen=mi["max_s"],
+                            position_embeddings=pe,
+                        )
+                    else:
+                        attn = self.self_attn(x_normed)
+
                 x_mid = x_in + attn
 
             d_x_after_attn_total = (
