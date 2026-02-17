@@ -36,7 +36,7 @@ class MoESetup(BaseSettings):
     comm_scaling_factor: int = 1
 
 
-class Config(BaseSettings):
+class EPConfig(BaseSettings):
     moe: MoESetup
     world_size: int
 
@@ -120,8 +120,8 @@ def get_moe_config(scale: MoEScale = MoEScale.TINY) -> MoESetup:
 
 
 @functools.lru_cache
-def get_cfg(world_size: int, scale: MoEScale) -> Config:
-    cfg = Config(
+def get_ep_cfg(world_size: int, scale: MoEScale) -> EPConfig:
+    cfg = EPConfig(
         moe=get_moe_config(scale),
         world_size=world_size,
     )
